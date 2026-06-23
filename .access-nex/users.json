@@ -1,0 +1,30 @@
+{
+  "admin": {
+    "sub": "user-admin-1781674069240800700",
+    "username": "admin",
+    "password": "V2Lamt3aTnDWCC",
+    "email": "admin@example.com",
+    "name": ""
+  },
+  "alice": {
+    "sub": "user-alice-1781630789891128100",
+    "username": "alice",
+    "password": "secret123",
+    "email": "alice@example.com",
+    "name": "Alice Smith"
+  },
+  "omegadc": {
+    "sub": "user-omegadc-1781668561185403200",
+    "username": "omegadc",
+    "password": "123OmegaDC321@",
+    "email": "help@edxmaple.com",
+    "name": "Omega DC"
+  },
+  "portainer-test": {
+    "sub": "user-portainer-test-1781670609365057300",
+    "username": "portainer-test",
+    "password": "portainer-pass",
+    "email": "portainer@example.com",
+    "name": "Portainer Test User"
+  }
+}
