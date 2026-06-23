@@ -1,0 +1,16 @@
+[
+  {
+    "id": 1,
+    "username": "gopesh",
+    "password": "hashed_password_here",
+    "role": "admin",
+    "email": "gopesh@accessnex.com"
+  },
+  {
+    "id": 2,
+    "username": "david",
+    "password": "hashed_password_here",
+    "role": "admin",
+    "email": "david@accessnex.com"
+  }
+]
