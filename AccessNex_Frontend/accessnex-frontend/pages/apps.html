@@ -1,0 +1,155 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>AccessNex — Applications</title>
+  <link rel="preconnect" href="https://fonts.googleapis.com" />
+  <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600&display=swap" rel="stylesheet" />
+  <link rel="stylesheet" href="../css/styles.css" />
+  <style>
+    .modal-overlay { position:fixed;inset:0;background:rgba(0,0,0,0.6);display:none;align-items:center;justify-content:center;z-index:200; }
+    .modal-overlay.open { display:flex; }
+    .modal { background:var(--bg-surface);border:0.5px solid var(--border);border-radius:var(--radius-lg);padding:1.5rem;width:380px;max-width:95vw; }
+    .modal-title { font-size:15px;font-weight:600;margin-bottom:1.25rem; }
+    .modal-actions { display:flex;gap:8px;justify-content:flex-end;margin-top:1rem; }
+  </style>
+</head>
+<body>
+  <div class="main-wrap">
+    <div class="page-header" style="display:flex;align-items:center;justify-content:space-between;">
+      <div>
+        <h1 class="page-title">Applications</h1>
+        <p class="page-sub">Registered applications and client IDs</p>
+      </div>
+      <button class="btn btn-accent-dim" onclick="openModal()">+ Register app</button>
+    </div>
+
+    <div class="card">
+      <div class="card-header">
+        <span class="card-title">
+          <svg viewBox="0 0 24 24"><rect x="2" y="2" width="9" height="9"/><rect x="13" y="2" width="9" height="9"/><rect x="2" y="13" width="9" height="9"/><rect x="13" y="13" width="9" height="9"/></svg>
+          All applications
+        </span>
+      </div>
+      <table>
+        <thead><tr><th>Name</th><th>Description</th><th>Client ID</th><th>Status</th><th>Actions</th></tr></thead>
+        <tbody id="appsBody"><tr><td colspan="5" class="loading">Loading...</td></tr></tbody>
+      </table>
+    </div>
+  </div>
+
+  <div class="modal-overlay" id="modalOverlay" onclick="closeModalOutside(event)">
+    <div class="modal">
+      <p class="modal-title" id="modalTitle">Register application</p>
+      <div class="field"><label>Name</label><input type="text" id="fName" placeholder="App name" /></div>
+      <div class="field"><label>Description</label><input type="text" id="fDesc" placeholder="Short description" /></div>
+      <div class="field" id="statusField" style="display:none;">
+        <label>Status</label>
+        <select id="fActive"><option value="true">Active</option><option value="false">Inactive</option></select>
+      </div>
+      <p class="error-msg" id="modalErr"></p>
+      <div class="modal-actions">
+        <button class="btn btn-ghost" onclick="closeModal()">Cancel</button>
+        <button class="btn btn-primary" onclick="submitModal()">Save</button>
+      </div>
+    </div>
+  </div>
+
+  <script src="../js/api.js"></script>
+  <script src="../js/nav.js"></script>
+  <script>
+    requireAuth();
+    injectNav("apps");
+    let editingId = null;
+
+    async function loadApps() {
+      const tbody = document.getElementById("appsBody");
+      try {
+        const apps = await AppsAPI.list();
+        if (!apps.length) {
+          tbody.innerHTML = `<tr><td colspan="5" style="color:var(--text-muted);padding:1rem;text-align:center">No apps registered yet.</td></tr>`;
+          return;
+        }
+        tbody.innerHTML = apps.map(a => `
+          <tr>
+            <td class="td-name">${a.name}</td>
+            <td>${a.description || '—'}</td>
+            <td class="td-mono">${a.client_id}</td>
+            <td><span class="badge ${a.is_active ? 'badge-green' : 'badge-red'}">${a.is_active ? 'Active' : 'Inactive'}</span></td>
+            <td style="display:flex;gap:6px;">
+              <button class="btn btn-ghost btn-sm" onclick="openEditModal(${a.id},'${a.name}','${a.description||''}',${a.is_active})">Edit</button>
+              <button class="btn btn-danger btn-sm" onclick="deleteApp(${a.id})">Delete</button>
+            </td>
+          </tr>
+        `).join("");
+      } catch (err) {
+        tbody.innerHTML = `<tr><td colspan="5" class="error-msg" style="padding:1rem">${err.message}</td></tr>`;
+      }
+    }
+
+    function openModal() {
+      editingId = null;
+      document.getElementById("modalTitle").textContent = "Register application";
+      document.getElementById("fName").value = "";
+      document.getElementById("fDesc").value = "";
+      document.getElementById("statusField").style.display = "none";
+      document.getElementById("fName").removeAttribute("disabled");
+      document.getElementById("modalErr").textContent = "";
+      document.getElementById("modalOverlay").classList.add("open");
+    }
+
+    function openEditModal(id, name, desc, isActive) {
+      editingId = id;
+      document.getElementById("modalTitle").textContent = "Edit application";
+      document.getElementById("fName").value = name;
+      document.getElementById("fName").setAttribute("disabled", true);
+      document.getElementById("fDesc").value = desc;
+      document.getElementById("fActive").value = String(isActive);
+      document.getElementById("statusField").style.display = "block";
+      document.getElementById("modalErr").textContent = "";
+      document.getElementById("modalOverlay").classList.add("open");
+    }
+
+    function closeModal() { document.getElementById("modalOverlay").classList.remove("open"); }
+    function closeModalOutside(e) { if (e.target === document.getElementById("modalOverlay")) closeModal(); }
+
+    async function submitModal() {
+      const errEl = document.getElementById("modalErr");
+      errEl.textContent = "";
+      try {
+        if (editingId) {
+          await AppsAPI.update(editingId, {
+            description: document.getElementById("fDesc").value,
+            is_active: document.getElementById("fActive").value === "true",
+          });
+          showToast("Application updated");
+        } else {
+          await AppsAPI.create({
+            name: document.getElementById("fName").value,
+            description: document.getElementById("fDesc").value,
+          });
+          showToast("Application registered");
+        }
+        closeModal();
+        loadApps();
+      } catch (err) {
+        errEl.textContent = err.message;
+      }
+    }
+
+    async function deleteApp(id) {
+      if (!confirm("Delete this application? This cannot be undone.")) return;
+      try {
+        await AppsAPI.delete(id);
+        showToast("Application deleted");
+        loadApps();
+      } catch (err) {
+        showToast("Failed: " + err.message);
+      }
+    }
+
+    loadApps();
+  </script>
+</body>
+</html>

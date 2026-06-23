@@ -1,0 +1,172 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>AccessNex — Providers</title>
+  <link rel="preconnect" href="https://fonts.googleapis.com" />
+  <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600&display=swap" rel="stylesheet" />
+  <link rel="stylesheet" href="../css/styles.css" />
+  <style>
+    .modal-overlay { position:fixed;inset:0;background:rgba(0,0,0,0.6);display:none;align-items:center;justify-content:center;z-index:200; }
+    .modal-overlay.open { display:flex; }
+    .modal { background:var(--bg-surface);border:0.5px solid var(--border);border-radius:var(--radius-lg);padding:1.5rem;width:400px;max-width:95vw; }
+    .modal-title { font-size:15px;font-weight:600;margin-bottom:1.25rem; }
+    .modal-actions { display:flex;gap:8px;justify-content:flex-end;margin-top:1rem; }
+  </style>
+</head>
+<body>
+  <div class="main-wrap">
+    <div class="page-header" style="display:flex;align-items:center;justify-content:space-between;">
+      <div>
+        <h1 class="page-title">Providers</h1>
+        <p class="page-sub">Identity providers and authentication protocols</p>
+      </div>
+      <button class="btn btn-accent-dim" onclick="openModal()">+ Add provider</button>
+    </div>
+
+    <div class="card">
+      <div class="card-header">
+        <span class="card-title">
+          <svg viewBox="0 0 24 24"><path d="M18 20V10"/><path d="M12 20V4"/><path d="M6 20v-6"/></svg>
+          All providers
+        </span>
+      </div>
+      <table>
+        <thead><tr><th>Name</th><th>Protocol</th><th>Metadata URL</th><th>Status</th><th>Actions</th></tr></thead>
+        <tbody id="providersBody"><tr><td colspan="5" class="loading">Loading...</td></tr></tbody>
+      </table>
+    </div>
+  </div>
+
+  <div class="modal-overlay" id="modalOverlay" onclick="closeModalOutside(event)">
+    <div class="modal">
+      <p class="modal-title" id="modalTitle">Add provider</p>
+      <div class="field"><label>Name</label><input type="text" id="fName" placeholder="e.g. Keycloak" /></div>
+      <div class="field" id="protocolField">
+        <label>Protocol</label>
+        <select id="fProtocol"><option value="OIDC">OIDC</option><option value="OAuth2">OAuth2</option><option value="SAML">SAML</option></select>
+      </div>
+      <div class="field"><label>Client ID</label><input type="text" id="fClientId" placeholder="Optional" /></div>
+      <div class="field"><label>Client Secret</label><input type="password" id="fClientSecret" placeholder="Optional" /></div>
+      <div class="field"><label>Metadata URL</label><input type="text" id="fMetaUrl" placeholder="https://..." /></div>
+      <div class="field" id="statusField" style="display:none;">
+        <label>Status</label>
+        <select id="fActive"><option value="true">Active</option><option value="false">Inactive</option></select>
+      </div>
+      <p class="error-msg" id="modalErr"></p>
+      <div class="modal-actions">
+        <button class="btn btn-ghost" onclick="closeModal()">Cancel</button>
+        <button class="btn btn-primary" onclick="submitModal()">Save</button>
+      </div>
+    </div>
+  </div>
+
+  <script src="../js/api.js"></script>
+  <script src="../js/nav.js"></script>
+  <script>
+    requireAuth();
+    injectNav("providers");
+    let editingId = null;
+
+    const protocolBadge = p => p === "OIDC" || p === "OAuth2" ? "badge-blue" : "badge-amber";
+
+    async function loadProviders() {
+      const tbody = document.getElementById("providersBody");
+      try {
+        const providers = await ProvidersAPI.list();
+        if (!providers.length) {
+          tbody.innerHTML = `<tr><td colspan="5" style="color:var(--text-muted);padding:1rem;text-align:center">No providers yet.</td></tr>`;
+          return;
+        }
+        tbody.innerHTML = providers.map(p => `
+          <tr>
+            <td class="td-name">${p.name}</td>
+            <td><span class="badge ${protocolBadge(p.protocol)}">${p.protocol}</span></td>
+            <td style="font-size:12px;color:var(--text-muted);max-width:180px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;">${p.metadata_url || '—'}</td>
+            <td><span class="badge ${p.is_active ? 'badge-green' : 'badge-red'}">${p.is_active ? 'Active' : 'Inactive'}</span></td>
+            <td style="display:flex;gap:6px;">
+              <button class="btn btn-ghost btn-sm" onclick="openEditModal(${p.id},'${p.name}','${p.protocol}','${p.client_id||''}','${p.metadata_url||''}',${p.is_active})">Edit</button>
+              <button class="btn btn-danger btn-sm" onclick="deleteProvider(${p.id})">Delete</button>
+            </td>
+          </tr>
+        `).join("");
+      } catch (err) {
+        tbody.innerHTML = `<tr><td colspan="5" class="error-msg" style="padding:1rem">${err.message}</td></tr>`;
+      }
+    }
+
+    function openModal() {
+      editingId = null;
+      document.getElementById("modalTitle").textContent = "Add provider";
+      ["fName","fClientId","fClientSecret","fMetaUrl"].forEach(id => document.getElementById(id).value = "");
+      document.getElementById("fProtocol").value = "OIDC";
+      document.getElementById("protocolField").style.display = "block";
+      document.getElementById("statusField").style.display = "none";
+      document.getElementById("fName").removeAttribute("disabled");
+      document.getElementById("modalErr").textContent = "";
+      document.getElementById("modalOverlay").classList.add("open");
+    }
+
+    function openEditModal(id, name, protocol, clientId, metaUrl, isActive) {
+      editingId = id;
+      document.getElementById("modalTitle").textContent = "Edit provider";
+      document.getElementById("fName").value = name;
+      document.getElementById("fName").setAttribute("disabled", true);
+      document.getElementById("fClientId").value = clientId;
+      document.getElementById("fClientSecret").value = "";
+      document.getElementById("fMetaUrl").value = metaUrl;
+      document.getElementById("fActive").value = String(isActive);
+      document.getElementById("protocolField").style.display = "none";
+      document.getElementById("statusField").style.display = "block";
+      document.getElementById("modalErr").textContent = "";
+      document.getElementById("modalOverlay").classList.add("open");
+    }
+
+    function closeModal() { document.getElementById("modalOverlay").classList.remove("open"); }
+    function closeModalOutside(e) { if (e.target === document.getElementById("modalOverlay")) closeModal(); }
+
+    async function submitModal() {
+      const errEl = document.getElementById("modalErr");
+      errEl.textContent = "";
+      try {
+        if (editingId) {
+          await ProvidersAPI.update(editingId, {
+            client_id: document.getElementById("fClientId").value || null,
+            client_secret: document.getElementById("fClientSecret").value || null,
+            metadata_url: document.getElementById("fMetaUrl").value || null,
+            is_active: document.getElementById("fActive").value === "true",
+          });
+          showToast("Provider updated");
+        } else {
+          await ProvidersAPI.create({
+            name: document.getElementById("fName").value,
+            protocol: document.getElementById("fProtocol").value,
+            client_id: document.getElementById("fClientId").value || null,
+            client_secret: document.getElementById("fClientSecret").value || null,
+            metadata_url: document.getElementById("fMetaUrl").value || null,
+          });
+          showToast("Provider added");
+        }
+        closeModal();
+        loadProviders();
+      } catch (err) {
+        errEl.textContent = err.message;
+      }
+    }
+
+    async function deleteProvider(id) {
+      if (!confirm("Delete this provider? This cannot be undone.")) return;
+      try {
+        await ProvidersAPI.delete(id);
+        showToast("Provider deleted");
+        loadProviders();
+      } catch (err) {
+        showToast("Failed: " + err.message);
+      }
+    }
+
+    loadProviders();
+  </script>
+</body>
+</html>
