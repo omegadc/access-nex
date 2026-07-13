@@ -7,6 +7,7 @@ import (
 	"errors"
 	"fmt"
 	"net/http"
+	"os"
 	"strings"
 	"time"
 
@@ -62,15 +63,21 @@ func init() {
 	rootCmd.PersistentFlags().StringVar(&configDir, "config", defaultConfigDir,
 		"config directory (holds the SQLite database and key files)")
 
-	rootCmd.AddCommand(userCmd, appCmd, providerCmd, serverCmd, shutdownCmd, migrateCmd)
+	rootCmd.AddCommand(userCmd, appCmd, providerCmd, serverCmd, shutdownCmd, migrateCmd, auditCmd)
 
 	// user
-	userCmd.AddCommand(userAddCmd, userListCmd, userDeleteCmd)
+	userCmd.AddCommand(userAddCmd, userListCmd, userDeleteCmd, userPromoteCmd, userDemoteCmd)
 	userAddCmd.Flags().StringP("username", "u", "", "Username")
 	userAddCmd.Flags().StringP("password", "p", "", "Password")
 	userAddCmd.Flags().StringP("email", "e", "", "Email")
 	userAddCmd.Flags().StringP("name", "n", "", "Full name")
+	userAddCmd.Flags().Bool("admin", false, "Grant admin rights (access to /admin)")
 	userDeleteCmd.Flags().StringP("username", "u", "", "Username to delete")
+	userPromoteCmd.Flags().StringP("username", "u", "", "Username to promote")
+	userDemoteCmd.Flags().StringP("username", "u", "", "Username to demote")
+
+	// audit
+	auditCmd.Flags().IntP("limit", "n", 50, "Number of entries to show")
 
 	// app
 	appCmd.AddCommand(appCreateCmd, appListCmd, appShowCmd, appUpdateCmd, appDeleteCmd)
@@ -85,11 +92,14 @@ func init() {
 	appUpdateCmd.Flags().StringSliceP("redirect-uri", "r", nil, "Redirect URIs")
 	appUpdateCmd.Flags().StringP("provider", "p", "", "External provider ID")
 	appUpdateCmd.Flags().StringP("scopes", "s", "", "Scopes")
+	appUpdateCmd.Flags().String("id-token-enc-key", "", "Path to RSA public key PEM for ID-token encryption (JWE); 'none' to disable")
 	appDeleteCmd.Flags().StringP("id", "i", "", "Application ID")
 
 	// provider self
-	providerSelfCmd.AddCommand(providerSelfInitCmd, providerSelfInfoCmd)
+	providerSelfCmd.AddCommand(providerSelfInitCmd, providerSelfInfoCmd,
+		providerSelfRotateKeyCmd, providerSelfListKeysCmd, providerSelfRetireKeyCmd)
 	providerSelfInitCmd.Flags().StringP("issuer", "i", defaultIssuer, "Issuer URL")
+	providerSelfRetireKeyCmd.Flags().StringP("kid", "k", "", "Key ID to retire")
 
 	// provider external
 	sharedProviderFlags := func(cmd *cobra.Command) {
@@ -136,6 +146,7 @@ var userAddCmd = &cobra.Command{
 		if password == "" {
 			return fmt.Errorf("password is required")
 		}
+		admin, _ := cmd.Flags().GetBool("admin")
 		hash, err := bcrypt.GenerateFromPassword([]byte(password), bcrypt.DefaultCost)
 		if err != nil {
 			return err
@@ -146,11 +157,16 @@ var userAddCmd = &cobra.Command{
 			PasswordHash: string(hash),
 			Email:        email,
 			Name:         name,
+			IsAdmin:      admin,
 		}
 		if err := st.CreateUser(u); err != nil {
 			return err
 		}
-		fmt.Printf("✓ User '%s' created (subject: %s)\n", username, u.Subject)
+		role := ""
+		if admin {
+			role = " [admin]"
+		}
+		fmt.Printf("✓ User '%s' created (subject: %s)%s\n", username, u.Subject, role)
 		return nil
 	},
 }
@@ -370,6 +386,20 @@ var appUpdateCmd = &cobra.Command{
 		}
 		if scopesStr, _ := cmd.Flags().GetString("scopes"); scopesStr != "" {
 			a.Scopes = parseScopes(scopesStr)
+		}
+		if keyPath, _ := cmd.Flags().GetString("id-token-enc-key"); keyPath != "" {
+			if keyPath == "none" {
+				a.IDTokenEncKey = ""
+			} else {
+				pemBytes, err := os.ReadFile(keyPath)
+				if err != nil {
+					return fmt.Errorf("read encryption key: %w", err)
+				}
+				if _, err := secrets.ParsePublicKeyPEM(string(pemBytes)); err != nil {
+					return fmt.Errorf("invalid RSA public key PEM: %w", err)
+				}
+				a.IDTokenEncKey = string(pemBytes)
+			}
 		}
 		if err := st.UpdateApp(a); err != nil {
 			return err
@@ -688,11 +718,11 @@ var serverCmd = &cobra.Command{
 			issuer = defaultIssuer
 		}
 
-		key, err := secrets.LoadOrCreateSigningKey(configDir)
+		box, err := secrets.NewBox(configDir)
 		if err != nil {
 			return err
 		}
-		box, err := secrets.NewBox(configDir)
+		keys, err := loadSigningKeys(box)
 		if err != nil {
 			return err
 		}
@@ -702,7 +732,7 @@ var serverCmd = &cobra.Command{
 			return err
 		}
 
-		srv := server.New(issuer, key, st, box)
+		srv := server.New(issuer, keys, st, box)
 
 		// Purge expired codes, tokens, and sessions in the background.
 		go func() {

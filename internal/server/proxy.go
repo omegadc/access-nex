@@ -230,8 +230,10 @@ func (s *Server) handleOAuthCallback(w http.ResponseWriter, r *http.Request) {
 	http.Redirect(w, r, redir.String(), http.StatusFound)
 }
 
-// provisionExternalUser maps the provider's userinfo document to a row in the
-// users table, creating it on first login.
+// provisionExternalUser maps the provider's userinfo document to a local
+// user. If the provider vouches for the email (email_verified claim), the
+// identity is linked to an existing local account with the same address
+// instead of creating a duplicate user.
 func (s *Server) provisionExternalUser(ep *models.Provider, userInfo map[string]any) (string, error) {
 	externalID := fmt.Sprintf("%v", userInfo[ep.UserIdentifier])
 	email, _ := userInfo["email"].(string)
@@ -240,8 +242,19 @@ func (s *Server) provisionExternalUser(ep *models.Provider, userInfo map[string]
 	if login == "" {
 		login, _ = userInfo["preferred_username"].(string)
 	}
-	subject, _, err := s.store.EnsureExternalUser(ep.ID, externalID, login, email, name)
-	return subject, err
+	emailVerified, _ := userInfo["email_verified"].(bool)
+
+	subject, created, linked, err := s.store.EnsureExternalUser(ep.ID, externalID, login, email, name, emailVerified)
+	if err != nil {
+		return "", err
+	}
+	if created {
+		s.store.Audit("user_provisioned", subject, "", "", "provider "+ep.ID)
+	}
+	if linked {
+		s.store.Audit("account_linked", subject, "", "", "provider "+ep.ID+" linked by verified email "+email)
+	}
+	return subject, nil
 }
 
 // exchangeCodeWithProvider POSTs to a token endpoint to exchange an auth code.

@@ -119,6 +119,44 @@ func LoadOrCreateSigningKey(configDir string) (*rsa.PrivateKey, error) {
 	return key, nil
 }
 
+// GenerateRSAKey creates a new 2048-bit signing key.
+func GenerateRSAKey() (*rsa.PrivateKey, error) {
+	return rsa.GenerateKey(rand.Reader, 2048)
+}
+
+// EncodePrivateKeyPEM serializes an RSA key as PKCS#1 PEM text.
+func EncodePrivateKeyPEM(key *rsa.PrivateKey) string {
+	return string(pem.EncodeToMemory(&pem.Block{
+		Type:  "RSA PRIVATE KEY",
+		Bytes: x509.MarshalPKCS1PrivateKey(key),
+	}))
+}
+
+// ParsePrivateKeyPEM reverses EncodePrivateKeyPEM.
+func ParsePrivateKeyPEM(pemStr string) (*rsa.PrivateKey, error) {
+	block, _ := pem.Decode([]byte(pemStr))
+	if block == nil {
+		return nil, errors.New("invalid PEM")
+	}
+	return x509.ParsePKCS1PrivateKey(block.Bytes)
+}
+
+// ParsePublicKeyPEM parses an RSA public key in PKIX ("PUBLIC KEY") or
+// PKCS#1 ("RSA PUBLIC KEY") PEM form.
+func ParsePublicKeyPEM(pemStr string) (*rsa.PublicKey, error) {
+	block, _ := pem.Decode([]byte(pemStr))
+	if block == nil {
+		return nil, errors.New("invalid PEM")
+	}
+	if pub, err := x509.ParsePKIXPublicKey(block.Bytes); err == nil {
+		if rsaPub, ok := pub.(*rsa.PublicKey); ok {
+			return rsaPub, nil
+		}
+		return nil, errors.New("not an RSA public key")
+	}
+	return x509.ParsePKCS1PublicKey(block.Bytes)
+}
+
 // RandomToken returns a URL-safe random string of size random bytes.
 func RandomToken(size int) string {
 	buf := make([]byte, size)

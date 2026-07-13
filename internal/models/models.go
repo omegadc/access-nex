@@ -23,6 +23,9 @@ type User struct {
 	Name         string
 	ProviderID   string // "" = local account
 	ExternalID   string // user's ID at the external provider
+	IsAdmin      bool
+	FailedLogins int
+	LockedUntil  time.Time // zero = not locked
 	CreatedAt    time.Time
 	UpdatedAt    time.Time
 }
@@ -30,16 +33,17 @@ type User struct {
 // App is a row in the applications table: an OAuth2/OIDC client registration.
 // ProviderID selects which provider authenticates its users ("" = self).
 type App struct {
-	ID           string
-	Name         string
-	Secret       string // empty for public (PKCE) clients
-	Public       bool
-	ProviderID   string
-	RedirectURIs []string
-	Scopes       []string
-	Enabled      bool
-	CreatedAt    time.Time
-	UpdatedAt    time.Time
+	ID            string
+	Name          string
+	Secret        string // empty for public (PKCE) clients
+	Public        bool
+	ProviderID    string
+	RedirectURIs  []string
+	Scopes        []string
+	Enabled       bool
+	IDTokenEncKey string // PEM RSA public key; non-empty = encrypt ID tokens (JWE)
+	CreatedAt     time.Time
+	UpdatedAt     time.Time
 }
 
 // Provider is a row in the providers table. It unifies the local provider
@@ -86,6 +90,7 @@ type TokenRecord struct {
 	ClientID  string
 	Subject   string
 	Scope     []string
+	Audiences []string // extra audiences beyond the client itself
 	ExpiresAt time.Time
 	Revoked   bool
 }
@@ -95,8 +100,38 @@ type RefreshRecord struct {
 	ClientID  string
 	Subject   string
 	Scope     []string
+	Family    string // rotation family: reuse of a revoked member revokes all
 	ExpiresAt time.Time
 	Revoked   bool
+}
+
+// Grant records that a user approved an application for a set of scopes.
+type Grant struct {
+	Subject   string
+	ClientID  string
+	Scopes    []string
+	CreatedAt time.Time
+	UpdatedAt time.Time
+}
+
+// SigningKey is a JWT signing key; the PEM is AES-GCM encrypted at rest.
+type SigningKey struct {
+	Kid       string
+	PEMEnc    string
+	Active    bool
+	CreatedAt time.Time
+	RetiredAt time.Time // zero = still published in JWKS
+}
+
+// AuditEntry is one row of the security audit log.
+type AuditEntry struct {
+	ID       int64
+	At       time.Time
+	Event    string
+	Subject  string
+	ClientID string
+	IP       string
+	Detail   string
 }
 
 type Session struct {

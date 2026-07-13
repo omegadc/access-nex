@@ -55,20 +55,20 @@ func (s *Store) ConsumeAuthCode(code string) (*models.AuthCode, error) {
 
 func (s *Store) SaveAccessToken(t *models.TokenRecord) error {
 	_, err := s.db.Exec(`
-		INSERT INTO access_tokens (token, jti, client_id, subject, scopes, expires_at, revoked)
-		VALUES (?, ?, ?, ?, ?, ?, 0)`,
-		t.Token, t.JTI, t.ClientID, t.Subject, joinScopes(t.Scope),
+		INSERT INTO access_tokens (token, jti, client_id, subject, scopes, audiences, expires_at, revoked)
+		VALUES (?, ?, ?, ?, ?, ?, ?, 0)`,
+		t.Token, t.JTI, t.ClientID, t.Subject, joinScopes(t.Scope), joinScopes(t.Audiences),
 		t.ExpiresAt.UTC().Format(time.RFC3339))
 	return err
 }
 
 func (s *Store) GetAccessToken(token string) (*models.TokenRecord, error) {
 	var t models.TokenRecord
-	var scopes, expires string
+	var scopes, audiences, expires string
 	err := s.db.QueryRow(`
-		SELECT token, jti, client_id, subject, scopes, expires_at, revoked
+		SELECT token, jti, client_id, subject, scopes, audiences, expires_at, revoked
 		FROM access_tokens WHERE token = ?`, token).
-		Scan(&t.Token, &t.JTI, &t.ClientID, &t.Subject, &scopes, &expires, &t.Revoked)
+		Scan(&t.Token, &t.JTI, &t.ClientID, &t.Subject, &scopes, &audiences, &expires, &t.Revoked)
 	if err != nil {
 		if errors.Is(err, sql.ErrNoRows) {
 			return nil, ErrNotFound
@@ -76,17 +76,22 @@ func (s *Store) GetAccessToken(token string) (*models.TokenRecord, error) {
 		return nil, err
 	}
 	t.Scope = splitScopes(scopes)
+	t.Audiences = splitScopes(audiences)
 	t.ExpiresAt = parseTime(expires)
 	return &t, nil
 }
 
 // ── Refresh tokens ────────────────────────────────────────────────────────────
 
+// ErrRefreshReuse signals that an already-revoked refresh token was replayed;
+// the whole rotation family has been revoked in response.
+var ErrRefreshReuse = errors.New("refresh token reuse detected")
+
 func (s *Store) SaveRefreshToken(t *models.RefreshRecord) error {
 	_, err := s.db.Exec(`
-		INSERT INTO refresh_tokens (token, client_id, subject, scopes, expires_at, revoked)
-		VALUES (?, ?, ?, ?, ?, 0)`,
-		t.Token, t.ClientID, t.Subject, joinScopes(t.Scope),
+		INSERT INTO refresh_tokens (token, client_id, subject, scopes, family, expires_at, revoked)
+		VALUES (?, ?, ?, ?, ?, ?, 0)`,
+		t.Token, t.ClientID, t.Subject, joinScopes(t.Scope), t.Family,
 		t.ExpiresAt.UTC().Format(time.RFC3339))
 	return err
 }
@@ -95,9 +100,9 @@ func (s *Store) GetRefreshToken(token string) (*models.RefreshRecord, error) {
 	var t models.RefreshRecord
 	var scopes, expires string
 	err := s.db.QueryRow(`
-		SELECT token, client_id, subject, scopes, expires_at, revoked
+		SELECT token, client_id, subject, scopes, family, expires_at, revoked
 		FROM refresh_tokens WHERE token = ?`, token).
-		Scan(&t.Token, &t.ClientID, &t.Subject, &scopes, &expires, &t.Revoked)
+		Scan(&t.Token, &t.ClientID, &t.Subject, &scopes, &t.Family, &expires, &t.Revoked)
 	if err != nil {
 		if errors.Is(err, sql.ErrNoRows) {
 			return nil, ErrNotFound
@@ -110,13 +115,23 @@ func (s *Store) GetRefreshToken(token string) (*models.RefreshRecord, error) {
 }
 
 // ConsumeRefreshToken validates a refresh token for a client and marks it
-// revoked (single-use rotation). Returns ErrNotFound if invalid.
+// revoked (single-use rotation). Presenting a token that was already used
+// is treated as theft: the entire family is revoked and ErrRefreshReuse is
+// returned so the caller can audit it.
 func (s *Store) ConsumeRefreshToken(token, clientID string) (*models.RefreshRecord, error) {
 	t, err := s.GetRefreshToken(token)
 	if err != nil {
 		return nil, err
 	}
-	if t.Revoked || t.ClientID != clientID || time.Now().After(t.ExpiresAt) {
+	if t.Revoked {
+		if t.Family != "" {
+			if _, err := s.db.Exec(`UPDATE refresh_tokens SET revoked = 1 WHERE family = ?`, t.Family); err != nil {
+				return nil, err
+			}
+		}
+		return t, ErrRefreshReuse
+	}
+	if t.ClientID != clientID || time.Now().After(t.ExpiresAt) {
 		return nil, ErrNotFound
 	}
 	if _, err := s.db.Exec(`UPDATE refresh_tokens SET revoked = 1 WHERE token = ?`, token); err != nil {

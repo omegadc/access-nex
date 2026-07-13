@@ -6,6 +6,7 @@ import (
 	"crypto/rsa"
 	"crypto/sha256"
 	"encoding/json"
+	"errors"
 	"math/big"
 	"net/http"
 	"net/url"
@@ -14,10 +15,12 @@ import (
 
 	"github.com/omegadc/access-nex/internal/models"
 	"github.com/omegadc/access-nex/internal/secrets"
+	"github.com/omegadc/access-nex/internal/store"
 )
 
 type authRequest struct {
 	ResponseType        string
+	ResponseMode        string
 	ClientID            string
 	RedirectURI         string
 	Scope               string
@@ -26,6 +29,18 @@ type authRequest struct {
 	CodeChallenge       string
 	CodeChallengeMethod string
 	Prompt              string
+}
+
+// fields returns the request as hidden-form fields so the login and consent
+// pages can round-trip it.
+func (req authRequest) fields() map[string]string {
+	return map[string]string{
+		"response_type": req.ResponseType, "response_mode": req.ResponseMode,
+		"client_id": req.ClientID, "redirect_uri": req.RedirectURI,
+		"scope": req.Scope, "state": req.State, "nonce": req.Nonce,
+		"code_challenge": req.CodeChallenge, "code_challenge_method": req.CodeChallengeMethod,
+		"prompt": req.Prompt,
+	}
 }
 
 func (s *Server) handleHealth(w http.ResponseWriter, r *http.Request) {
@@ -44,27 +59,35 @@ func (s *Server) handleDiscovery(w http.ResponseWriter, r *http.Request) {
 		"registration_endpoint":                         s.endpoint("/register"),
 		"end_session_endpoint":                          s.endpoint("/end_session"),
 		"response_types_supported":                      []string{"code"},
+		"response_modes_supported":                      []string{"query", "form_post"},
 		"grant_types_supported":                         []string{"authorization_code", "refresh_token", "client_credentials"},
 		"subject_types_supported":                       []string{"public"},
 		"id_token_signing_alg_values_supported":         []string{"RS256"},
+		"id_token_encryption_alg_values_supported":      []string{"RSA-OAEP-256"},
+		"id_token_encryption_enc_values_supported":      []string{"A256GCM"},
 		"token_endpoint_auth_methods_supported":         []string{"client_secret_basic", "client_secret_post", "none"},
 		"revocation_endpoint_auth_methods_supported":    []string{"client_secret_basic", "client_secret_post", "none"},
 		"introspection_endpoint_auth_methods_supported": []string{"client_secret_basic", "client_secret_post", "none"},
 		"scopes_supported":                              []string{"openid", "profile", "email", "offline_access"},
 		"claims_supported":                              []string{"sub", "iss", "aud", "exp", "iat", "auth_time", "nonce", "email", "name", "preferred_username"},
 		"code_challenge_methods_supported":              []string{"S256", "plain"},
+		"prompt_values_supported":                       []string{"none", "login", "consent", "select_account"},
 	})
 }
 
+// handleJWKS publishes every non-retired signing key so tokens signed before
+// a rotation keep verifying.
 func (s *Server) handleJWKS(w http.ResponseWriter, r *http.Request) {
-	pub := s.key.PublicKey
-	writeJSON(w, http.StatusOK, map[string]any{
-		"keys": []map[string]any{{
-			"kty": "RSA", "use": "sig", "kid": s.keyID, "alg": "RS256",
+	keys := make([]map[string]any, 0, len(s.keys))
+	for _, sk := range s.keys {
+		pub := sk.Key.PublicKey
+		keys = append(keys, map[string]any{
+			"kty": "RSA", "use": "sig", "kid": sk.Kid, "alg": "RS256",
 			"n": b64(pub.N.Bytes()),
 			"e": b64(big.NewInt(int64(pub.E)).Bytes()),
-		}},
-	})
+		})
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"keys": keys})
 }
 
 // ── /authorize ────────────────────────────────────────────────────────────────
@@ -81,6 +104,7 @@ func (s *Server) handleAuthorize(w http.ResponseWriter, r *http.Request) {
 	}
 	req := authRequest{
 		ResponseType:        r.Form.Get("response_type"),
+		ResponseMode:        r.Form.Get("response_mode"),
 		ClientID:            r.Form.Get("client_id"),
 		RedirectURI:         r.Form.Get("redirect_uri"),
 		Scope:               r.Form.Get("scope"),
@@ -107,35 +131,93 @@ func (s *Server) handleAuthorize(w http.ResponseWriter, r *http.Request) {
 		req.Scope = "openid"
 	}
 	if req.ResponseType != "code" {
-		s.redirectWithOAuthError(w, r, req.RedirectURI, "unsupported_response_type", "Only code is supported", req.State)
+		s.deliverAuthError(w, r, req, "unsupported_response_type", "Only code is supported")
+		return
+	}
+	if req.ResponseMode != "" && req.ResponseMode != "query" && req.ResponseMode != "form_post" {
+		s.deliverAuthError(w, r, req, "invalid_request", "Unsupported response_mode")
 		return
 	}
 	if req.CodeChallenge != "" && req.CodeChallengeMethod != "" &&
 		req.CodeChallengeMethod != "S256" && req.CodeChallengeMethod != "plain" {
-		s.redirectWithOAuthError(w, r, req.RedirectURI, "invalid_request", "Unsupported code_challenge_method", req.State)
+		s.deliverAuthError(w, r, req, "invalid_request", "Unsupported code_challenge_method")
 		return
 	}
 
-	if subject, ok := s.subjectFromSession(r); ok {
+	prompts := parseScope(req.Prompt)
+	forceLogin := hasScope(prompts, "login") || hasScope(prompts, "select_account")
+	forceConsent := hasScope(prompts, "consent")
+	promptNone := hasScope(prompts, "none")
+
+	// Consent decision submitted from the consent page.
+	if r.Method == http.MethodPost && r.Form.Get("consent") != "" {
+		subject, ok := s.subjectFromSession(r)
+		if !ok {
+			s.renderLogin(w, req, client.Name, "Session expired — sign in again")
+			return
+		}
+		scope := parseScope(req.Scope)
+		if r.Form.Get("consent") != "approve" {
+			s.store.Audit("consent_denied", subject, client.ID, clientIP(r), strings.Join(scope, " "))
+			s.deliverAuthError(w, r, req, "access_denied", "User denied the request")
+			return
+		}
+		if err := s.store.SaveGrant(subject, client.ID, scope); err != nil {
+			s.deliverAuthError(w, r, req, "server_error", "Could not save grant")
+			return
+		}
+		s.store.Audit("consent_granted", subject, client.ID, clientIP(r), strings.Join(scope, " "))
 		s.issueAuthorizationCode(w, r, req, subject)
 		return
 	}
-	if req.Prompt == "none" {
-		s.redirectWithOAuthError(w, r, req.RedirectURI, "login_required", "Login required", req.State)
-		return
+
+	// Establish who the user is. prompt=login / select_account forces
+	// re-authentication even when a session exists.
+	subject, loggedIn := "", false
+	if !forceLogin {
+		subject, loggedIn = s.subjectFromSession(r)
 	}
-	if r.Method == http.MethodPost {
-		username := r.Form.Get("username")
-		password := r.Form.Get("password")
-		if subject, ok := s.authenticateUser(username, password); ok {
-			s.startSession(w, subject)
-			s.issueAuthorizationCode(w, r, req, subject)
+	if !loggedIn {
+		if promptNone {
+			s.deliverAuthError(w, r, req, "login_required", "Login required")
 			return
 		}
-		s.renderLogin(w, req, client.Name, "Invalid username or password")
+		if r.Method == http.MethodPost && r.Form.Get("username") != "" {
+			if !s.loginLimiter.allow(clientIP(r)) {
+				s.renderLogin(w, req, client.Name, "Too many attempts — try again in a minute")
+				return
+			}
+			sub, ok := s.authenticateUser(r.Form.Get("username"), r.Form.Get("password"), clientIP(r))
+			if !ok {
+				s.renderLogin(w, req, client.Name, "Invalid username or password")
+				return
+			}
+			s.startSession(w, sub)
+			subject = sub
+			// prompt=login is satisfied by the fresh authentication.
+			forceLogin = false
+		} else {
+			s.renderLogin(w, req, client.Name, "")
+			return
+		}
+	}
+
+	// Consent: skip only when a remembered grant covers all requested scopes.
+	scope := parseScope(req.Scope)
+	granted, err := s.store.HasGrant(subject, client.ID, scope)
+	if err != nil {
+		s.deliverAuthError(w, r, req, "server_error", "Could not check grant")
 		return
 	}
-	s.renderLogin(w, req, client.Name, "")
+	if forceConsent || !granted {
+		if promptNone {
+			s.deliverAuthError(w, r, req, "consent_required", "Consent required")
+			return
+		}
+		s.renderConsent(w, req, client, s.userBySubject(subject), scope)
+		return
+	}
+	s.issueAuthorizationCode(w, r, req, subject)
 }
 
 func (s *Server) issueAuthorizationCode(w http.ResponseWriter, r *http.Request, req authRequest, subject string) {
@@ -151,30 +233,47 @@ func (s *Server) issueAuthorizationCode(w http.ResponseWriter, r *http.Request, 
 		ExpiresAt: time.Now().Add(5 * time.Minute), AuthTime: time.Now(),
 	})
 	if err != nil {
-		s.redirectWithOAuthError(w, r, req.RedirectURI, "server_error", "Could not issue code", req.State)
+		s.deliverAuthError(w, r, req, "server_error", "Could not issue code")
 		return
 	}
-	redirectURL, _ := url.Parse(req.RedirectURI)
-	q := redirectURL.Query()
-	q.Set("code", code)
-	q.Set("iss", s.issuer)
+	params := map[string]string{"code": code, "iss": s.issuer}
 	if req.State != "" {
-		q.Set("state", req.State)
+		params["state"] = req.State
 	}
-	redirectURL.RawQuery = q.Encode()
-	http.Redirect(w, r, redirectURL.String(), http.StatusFound)
+	s.deliverAuthResponse(w, r, req, params)
 }
 
-func (s *Server) redirectWithOAuthError(w http.ResponseWriter, r *http.Request, redirectURI, code, description, state string) {
-	u, _ := url.Parse(redirectURI)
+// deliverAuthResponse returns parameters to the client's redirect URI using
+// the requested response_mode: query redirect (default) or form_post.
+func (s *Server) deliverAuthResponse(w http.ResponseWriter, r *http.Request, req authRequest, params map[string]string) {
+	if req.ResponseMode == "form_post" {
+		inputs := ""
+		for k, v := range params {
+			inputs += `<input type="hidden" name="` + esc(k) + `" value="` + esc(v) + `">`
+		}
+		page := `<!doctype html><html><head><meta charset="utf-8"><title>Redirecting…</title></head>
+<body onload="document.forms[0].submit()">
+<form method="post" action="` + esc(req.RedirectURI) + `">` + inputs + `
+<noscript><button type="submit">Continue</button></noscript></form></body></html>`
+		w.Header().Set("Content-Type", "text/html; charset=utf-8")
+		w.Write([]byte(page))
+		return
+	}
+	u, _ := url.Parse(req.RedirectURI)
 	q := u.Query()
-	q.Set("error", code)
-	q.Set("error_description", description)
-	if state != "" {
-		q.Set("state", state)
+	for k, v := range params {
+		q.Set(k, v)
 	}
 	u.RawQuery = q.Encode()
 	http.Redirect(w, r, u.String(), http.StatusFound)
+}
+
+func (s *Server) deliverAuthError(w http.ResponseWriter, r *http.Request, req authRequest, code, description string) {
+	params := map[string]string{"error": code, "error_description": description}
+	if req.State != "" {
+		params["state"] = req.State
+	}
+	s.deliverAuthResponse(w, r, req, params)
 }
 
 // ── /token ────────────────────────────────────────────────────────────────────
@@ -183,6 +282,10 @@ func (s *Server) handleToken(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodPost {
 		w.Header().Set("Allow", "POST")
 		writeOAuthError(w, http.StatusMethodNotAllowed, "invalid_request", "Use POST")
+		return
+	}
+	if !s.tokenLimiter.allow(clientIP(r)) {
+		writeOAuthError(w, http.StatusTooManyRequests, "slow_down", "Rate limit exceeded")
 		return
 	}
 	if err := r.ParseForm(); err != nil {
@@ -205,6 +308,18 @@ func (s *Server) handleToken(w http.ResponseWriter, r *http.Request) {
 	default:
 		writeOAuthError(w, http.StatusBadRequest, "unsupported_grant_type", "Unsupported grant_type")
 	}
+}
+
+// parseAudiences validates the optional `audience` parameter: every value
+// must be a registered, enabled application.
+func (s *Server) parseAudiences(r *http.Request) ([]string, error) {
+	audiences := parseScope(strings.Join(r.Form["audience"], " "))
+	for _, aud := range audiences {
+		if s.clientByID(aud) == nil {
+			return nil, errors.New("unknown audience: " + aud)
+		}
+	}
+	return audiences, nil
 }
 
 func (s *Server) handleAuthorizationCodeGrant(w http.ResponseWriter, r *http.Request, client *models.App) {
@@ -234,11 +349,17 @@ func (s *Server) handleAuthorizationCodeGrant(w http.ResponseWriter, r *http.Req
 		writeOAuthError(w, http.StatusBadRequest, "invalid_grant", "Invalid code_verifier")
 		return
 	}
-	response, err := s.issueTokenResponse(client.ID, code.Subject, code.Scope, code.Nonce, code.AuthTime, true)
+	audiences, err := s.parseAudiences(r)
+	if err != nil {
+		writeOAuthError(w, http.StatusBadRequest, "invalid_target", err.Error())
+		return
+	}
+	response, err := s.issueTokenResponse(client, code.Subject, code.Scope, audiences, code.Nonce, code.AuthTime, "")
 	if err != nil {
 		writeOAuthError(w, http.StatusInternalServerError, "server_error", "Could not issue token")
 		return
 	}
+	s.store.Audit("token_issued", code.Subject, client.ID, clientIP(r), "authorization_code")
 	writeJSON(w, http.StatusOK, response)
 }
 
@@ -248,17 +369,23 @@ func (s *Server) handleRefreshTokenGrant(w http.ResponseWriter, r *http.Request,
 		writeOAuthError(w, http.StatusBadRequest, "invalid_request", "Missing refresh_token")
 		return
 	}
-	// Single-use: the store validates and revokes the token in one step.
 	refresh, err := s.store.ConsumeRefreshToken(refreshToken, client.ID)
 	if err != nil {
+		if errors.Is(err, store.ErrRefreshReuse) {
+			s.store.Audit("refresh_reuse_detected", refresh.Subject, client.ID, clientIP(r),
+				"family "+refresh.Family+" revoked")
+		}
 		writeOAuthError(w, http.StatusBadRequest, "invalid_grant", "Invalid refresh_token")
 		return
 	}
-	response, err := s.issueTokenResponse(client.ID, refresh.Subject, refresh.Scope, "", time.Now(), true)
+	// The replacement refresh token stays in the same family so replay of
+	// the old token can revoke every descendant.
+	response, err := s.issueTokenResponse(client, refresh.Subject, refresh.Scope, nil, "", time.Now(), refresh.Family)
 	if err != nil {
 		writeOAuthError(w, http.StatusInternalServerError, "server_error", "Could not issue token")
 		return
 	}
+	s.store.Audit("token_refreshed", refresh.Subject, client.ID, clientIP(r), "")
 	writeJSON(w, http.StatusOK, response)
 }
 
@@ -271,11 +398,17 @@ func (s *Server) handleClientCredentialsGrant(w http.ResponseWriter, r *http.Req
 	if len(scope) == 0 {
 		scope = []string{"profile"}
 	}
-	record, err := s.issueAccessToken(client.ID, client.ID, scope)
+	audiences, err := s.parseAudiences(r)
+	if err != nil {
+		writeOAuthError(w, http.StatusBadRequest, "invalid_target", err.Error())
+		return
+	}
+	record, err := s.issueAccessToken(client.ID, client.ID, scope, audiences)
 	if err != nil {
 		writeOAuthError(w, http.StatusInternalServerError, "server_error", "Could not issue token")
 		return
 	}
+	s.store.Audit("token_issued", client.ID, client.ID, clientIP(r), "client_credentials")
 	writeJSON(w, http.StatusOK, map[string]any{
 		"access_token": record.Token,
 		"token_type":   "Bearer",
@@ -286,8 +419,8 @@ func (s *Server) handleClientCredentialsGrant(w http.ResponseWriter, r *http.Req
 
 // ── Token issuance ────────────────────────────────────────────────────────────
 
-func (s *Server) issueTokenResponse(clientID, subject string, scope []string, nonce string, authTime time.Time, includeRefresh bool) (map[string]any, error) {
-	access, err := s.issueAccessToken(clientID, subject, scope)
+func (s *Server) issueTokenResponse(client *models.App, subject string, scope, audiences []string, nonce string, authTime time.Time, refreshFamily string) (map[string]any, error) {
+	access, err := s.issueAccessToken(client.ID, subject, scope, audiences)
 	if err != nil {
 		return nil, err
 	}
@@ -297,18 +430,31 @@ func (s *Server) issueTokenResponse(clientID, subject string, scope []string, no
 		"scope":      strings.Join(scope, " "),
 	}
 	if hasScope(scope, "openid") {
-		idToken, err := s.issueIDToken(clientID, subject, scope, nonce, authTime, access.Token)
+		idToken, err := s.issueIDToken(client.ID, subject, scope, nonce, authTime, access.Token)
 		if err != nil {
 			return nil, err
 		}
+		// Encrypt the ID token (JWE) when the client registered a key for it.
+		if client.IDTokenEncKey != "" {
+			pub, err := secrets.ParsePublicKeyPEM(client.IDTokenEncKey)
+			if err != nil {
+				return nil, err
+			}
+			if idToken, err = encryptJWE(pub, idToken); err != nil {
+				return nil, err
+			}
+		}
 		resp["id_token"] = idToken
 	}
-	if includeRefresh && hasScope(scope, "offline_access") {
+	if hasScope(scope, "offline_access") {
 		refreshToken := secrets.RandomToken(48)
-		expires := time.Now().Add(30 * 24 * time.Hour)
+		family := refreshFamily
+		if family == "" {
+			family = "fam-" + secrets.RandomToken(16)
+		}
 		err := s.store.SaveRefreshToken(&models.RefreshRecord{
-			Token: refreshToken, ClientID: clientID, Subject: subject,
-			Scope: scope, ExpiresAt: expires,
+			Token: refreshToken, ClientID: client.ID, Subject: subject,
+			Scope: scope, Family: family, ExpiresAt: time.Now().Add(30 * 24 * time.Hour),
 		})
 		if err != nil {
 			return nil, err
@@ -318,12 +464,19 @@ func (s *Server) issueTokenResponse(clientID, subject string, scope []string, no
 	return resp, nil
 }
 
-func (s *Server) issueAccessToken(clientID, subject string, scope []string) (*models.TokenRecord, error) {
+func (s *Server) issueAccessToken(clientID, subject string, scope, audiences []string) (*models.TokenRecord, error) {
 	now := time.Now()
 	expires := now.Add(time.Hour)
 	jti := secrets.RandomToken(24)
+
+	// aud is the client itself plus any validated extra audiences; a single
+	// value is emitted as a string, several as an array (RFC 7519 §4.1.3).
+	audClaim := any(clientID)
+	if len(audiences) > 0 {
+		audClaim = append([]string{clientID}, audiences...)
+	}
 	claims := map[string]any{
-		"iss": s.issuer, "sub": subject, "aud": clientID, "client_id": clientID,
+		"iss": s.issuer, "sub": subject, "aud": audClaim, "client_id": clientID,
 		"scope": strings.Join(scope, " "), "exp": expires.Unix(), "iat": now.Unix(),
 		"jti": jti, "token_use": "access",
 	}
@@ -331,7 +484,10 @@ func (s *Server) issueAccessToken(clientID, subject string, scope []string) (*mo
 	if err != nil {
 		return nil, err
 	}
-	record := &models.TokenRecord{Token: token, JTI: jti, ClientID: clientID, Subject: subject, Scope: scope, ExpiresAt: expires}
+	record := &models.TokenRecord{
+		Token: token, JTI: jti, ClientID: clientID, Subject: subject,
+		Scope: scope, Audiences: audiences, ExpiresAt: expires,
+	}
 	if err := s.store.SaveAccessToken(record); err != nil {
 		return nil, err
 	}
@@ -364,7 +520,8 @@ func (s *Server) issueIDToken(clientID, subject string, scope []string, nonce st
 }
 
 func (s *Server) signJWT(claims map[string]any) (string, error) {
-	header := map[string]string{"alg": "RS256", "typ": "JWT", "kid": s.keyID}
+	active := s.activeKey()
+	header := map[string]string{"alg": "RS256", "typ": "JWT", "kid": active.Kid}
 	headerJSON, _ := json.Marshal(header)
 	claimsJSON, err := json.Marshal(claims)
 	if err != nil {
@@ -372,7 +529,7 @@ func (s *Server) signJWT(claims map[string]any) (string, error) {
 	}
 	signingInput := b64(headerJSON) + "." + b64(claimsJSON)
 	digest := sha256.Sum256([]byte(signingInput))
-	signature, err := rsa.SignPKCS1v15(rand.Reader, s.key, crypto.SHA256, digest[:])
+	signature, err := rsa.SignPKCS1v15(rand.Reader, active.Key, crypto.SHA256, digest[:])
 	if err != nil {
 		return "", err
 	}
@@ -402,6 +559,7 @@ func (s *Server) handleRevoke(w http.ResponseWriter, r *http.Request) {
 		writeOAuthError(w, http.StatusInternalServerError, "server_error", "Could not revoke token")
 		return
 	}
+	s.store.Audit("token_revoked", "", client.ID, clientIP(r), "")
 	w.WriteHeader(http.StatusOK)
 }
 
@@ -425,9 +583,13 @@ func (s *Server) handleIntrospect(w http.ResponseWriter, r *http.Request) {
 	access, _ := s.store.GetAccessToken(token)
 	refresh, _ := s.store.GetRefreshToken(token)
 	if access != nil && !access.Revoked && now.Before(access.ExpiresAt) {
+		aud := any(access.ClientID)
+		if len(access.Audiences) > 0 {
+			aud = append([]string{access.ClientID}, access.Audiences...)
+		}
 		writeJSON(w, http.StatusOK, map[string]any{
 			"active": true, "scope": strings.Join(access.Scope, " "),
-			"client_id": access.ClientID, "sub": access.Subject,
+			"client_id": access.ClientID, "sub": access.Subject, "aud": aud,
 			"token_type": "Bearer", "exp": access.ExpiresAt.Unix(),
 			"iss": s.issuer, "jti": access.JTI,
 		})
@@ -523,6 +685,7 @@ func (s *Server) handleRegister(w http.ResponseWriter, r *http.Request) {
 		writeOAuthError(w, http.StatusInternalServerError, "server_error", "Could not persist client")
 		return
 	}
+	s.store.Audit("client_registered", "", app.ID, clientIP(r), app.Name)
 
 	resp := map[string]any{
 		"client_id":                  app.ID,

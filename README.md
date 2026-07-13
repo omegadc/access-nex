@@ -20,10 +20,13 @@ access-nex/
 │   │   ├── providers.go        #   providers table (internal + external)
 │   │   └── runtime.go          #   auth codes, tokens, sessions
 │   ├── server/                 # HTTP OIDC/OAuth2 provider
-│   │   ├── server.go           #   routes, sessions, client/user authentication
+│   │   ├── server.go           #   routes, sessions, lockout, per-client CORS
 │   │   ├── oidc.go             #   /authorize /token /userinfo /introspect /revoke /register ...
 │   │   ├── proxy.go            #   external-provider SSO proxy (/oauth/start, /oauth/callback)
-│   │   ├── web.go              #   home dashboard, login form, portal, apps page
+│   │   ├── web.go              #   dashboard, login form, consent screen, portal
+│   │   ├── admin.go            #   /admin UI + /api/admin/* JSON API
+│   │   ├── ratelimit.go        #   per-IP rate limiting
+│   │   ├── jwe.go              #   ID-token encryption (RSA-OAEP-256 + A256GCM)
 │   │   └── helpers.go          #   JSON/PKCE/scope utilities
 │   ├── models/models.go        # Shared types + built-in provider templates
 │   └── secrets/secrets.go      # AES-GCM secret encryption, RSA signing key storage
@@ -44,8 +47,12 @@ The previous JSON files (`users.json`, `apps.json`, `providers.json`) are replac
 | `applications`   | Registered OAuth2/OIDC clients: redirect URIs, scopes, public/confidential, optional link to an external provider |
 | `auth_codes`     | Single-use authorization codes (deleted on exchange) |
 | `access_tokens`  | Issued access tokens, for introspection and revocation |
-| `refresh_tokens` | Single-use refresh tokens (rotated on every refresh) |
+| `refresh_tokens` | Single-use refresh tokens with rotation families (replay revokes the family) |
 | `sessions`       | Browser login sessions |
+| `grants`         | Remembered consent decisions per user + application |
+| `signing_keys`   | JWT signing keys (encrypted); one active, older keys stay in JWKS |
+| `identities`     | External identities linked to local users (account linking) |
+| `audit_log`      | Security events: logins, consent, token issuance, admin actions |
 
 Because runtime state is persisted, logins and issued tokens survive server restarts. Expired rows are purged every 10 minutes while the server runs.
 
@@ -86,10 +93,14 @@ Open http://localhost:8080 for the dashboard, or http://localhost:8080/login to 
 
 | Command | Description |
 |---------|-------------|
-| `user add/list/delete` | Manage local users (passwords stored as bcrypt hashes) |
-| `app create/list/show/update/delete` | Manage OAuth2/OIDC client applications |
+| `user add/list/delete` | Manage local users (bcrypt hashes; `--admin` grants admin rights) |
+| `user promote/demote` | Grant or revoke admin rights (access to `/admin`) |
+| `app create/list/show/update/delete` | Manage OAuth2/OIDC client applications (`app update --id-token-enc-key key.pem` enables ID-token encryption) |
 | `provider self init/info` | Initialize/inspect the local OIDC provider |
+| `provider self rotate-key/list-keys/retire-key` | JWT signing-key rotation with kid rollover |
 | `provider add/list/show/update/delete` | Manage external providers (`-t google\|github\|microsoft\|discord\|okta\|custom`) |
+| `audit -n 50` | Show recent audit log entries |
+| `migrate` | Import legacy JSON data into SQLite |
 | `server --addr :8080` | Run the HTTP provider |
 
 All commands accept `--config DIR` (default `.access-nex`) to select the data directory.
@@ -107,8 +118,21 @@ All commands accept `--config DIR` (default `.access-nex`) to select the data di
 | `POST /register` | RFC 7591 dynamic client registration (persisted to SQL) |
 | `GET /oauth/providers` | List enabled external providers |
 | `GET /oauth/start` | Begin SSO through an external provider |
-| `GET /oauth/callback` | Provider callback → provisions user, issues local code |
+| `GET /oauth/callback` | Provider callback → provisions/links user, issues local code |
 | `GET /`, `/login`, `/portal`, `/apps` | Web UI |
+| `GET /admin`, `/api/admin/*` | Admin console + JSON API (requires an admin user) |
+
+### Consent
+
+After login, users see a consent screen ("App X wants access to: profile, email…"). Approvals are stored in the `grants` table and skipped on later logins. `prompt=consent` forces the screen again; `prompt=login`/`select_account` force re-authentication; `prompt=none` fails with `login_required`/`consent_required` when interaction would be needed. `response_mode=form_post` is supported.
+
+### Account linking
+
+When an external provider reports a **verified** email (`email_verified: true`) that matches exactly one local user, the external identity is linked to that user (in `identities`) instead of creating a duplicate account.
+
+### Admin console
+
+Give a user admin rights (`access-nex user promote -u alice` or `user add --admin`), sign in at `/login`, then open `/admin` to manage users, applications, and providers and to view the audit log in the browser.
 
 ### External provider flow
 
@@ -140,4 +164,4 @@ If authentication fails, check `docker logs portainer` — OAuth errors (connect
 
 ## Security Notes
 
-Suitable for development and internal testing. Passwords are bcrypt-hashed, provider client secrets are AES-256-GCM encrypted at rest, JWTs are RS256-signed with a persistent key, and codes/tokens/sessions are persisted with single-use semantics — but CORS is wide open and there is no rate limiting or TLS termination. Put it behind HTTPS and harden before any production use.
+Suitable for development and internal testing. Implemented: bcrypt password hashes with 5-attempt/15-minute lockout, AES-256-GCM encryption of provider secrets and signing keys at rest, RS256 JWTs with key rotation, single-use auth codes and refresh tokens with reuse detection (family revocation), per-IP rate limiting on `/token` and logins, per-client CORS (only registered app origins), Secure cookies when the issuer is HTTPS, consent with remembered grants, and an audit log. Still missing for production: TLS termination (run behind HTTPS), 2FA, and email verification for local accounts.

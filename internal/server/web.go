@@ -9,6 +9,8 @@ import (
 	"log"
 	"net/http"
 	"strings"
+
+	"github.com/omegadc/access-nex/internal/models"
 )
 
 const pageStyle = `<style>
@@ -130,7 +132,11 @@ func (s *Server) handleLogin(w http.ResponseWriter, r *http.Request) {
 		if rt := r.Form.Get("return_to"); rt != "" {
 			returnTo = rt
 		}
-		if subject, ok := s.authenticateUser(r.Form.Get("username"), r.Form.Get("password")); ok {
+		if !s.loginLimiter.allow(clientIP(r)) {
+			s.renderDirectLoginPage(w, "Too many attempts — try again in a minute", returnTo)
+			return
+		}
+		if subject, ok := s.authenticateUser(r.Form.Get("username"), r.Form.Get("password"), clientIP(r)); ok {
 			s.startSession(w, subject)
 			http.Redirect(w, r, returnTo, http.StatusFound)
 			return
@@ -336,19 +342,68 @@ var authorizeLoginTemplate = template.Must(template.New("login").Parse(`<!doctyp
 </div></body></html>`))
 
 func (s *Server) renderLogin(w http.ResponseWriter, req authRequest, clientName, message string) {
-	fields := map[string]string{
-		"response_type": req.ResponseType, "client_id": req.ClientID,
-		"redirect_uri": req.RedirectURI, "scope": req.Scope, "state": req.State,
-		"nonce": req.Nonce, "code_challenge": req.CodeChallenge,
-		"code_challenge_method": req.CodeChallengeMethod, "prompt": req.Prompt,
-	}
 	data := struct {
 		Error      string
 		ClientName string
 		Fields     map[string]string
-	}{Error: message, ClientName: clientName, Fields: fields}
+	}{Error: message, ClientName: clientName, Fields: req.fields()}
 	w.Header().Set("Content-Type", "text/html; charset=utf-8")
 	if err := authorizeLoginTemplate.Execute(w, data); err != nil {
 		log.Printf("render login: %v", err)
 	}
+}
+
+// ── Consent page ──────────────────────────────────────────────────────────────
+
+var scopeDescriptions = map[string]string{
+	"openid":         "Confirm your identity (OpenID Connect sign-in)",
+	"profile":        "View your name and username",
+	"email":          "View your email address",
+	"offline_access": "Stay signed in (refresh tokens)",
+}
+
+// renderConsent shows "App X wants access to: ..." with approve/deny. The
+// decision posts back to /authorize with all original parameters.
+func (s *Server) renderConsent(w http.ResponseWriter, req authRequest, client *models.App, user *models.User, scopes []string) {
+	hidden := ""
+	for k, v := range req.fields() {
+		if v != "" {
+			hidden += `<input type="hidden" name="` + esc(k) + `" value="` + esc(v) + `">`
+		}
+	}
+	scopeItems := ""
+	for _, sc := range scopes {
+		desc := scopeDescriptions[sc]
+		if desc == "" {
+			desc = "Scope: " + sc
+		}
+		scopeItems += `<li><strong>` + esc(sc) + `</strong> — ` + esc(desc) + `</li>`
+	}
+	username := ""
+	if user != nil {
+		username = user.Username
+	}
+	page := `<!doctype html><html lang="en"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1"><title>Authorize — Access-Nex</title>` + loginStyle + `<style>
+ul.scopes{margin:0 0 22px 0;padding:0;list-style:none}
+ul.scopes li{padding:9px 12px;background:#f8f9ff;border-left:4px solid #667eea;border-radius:4px;margin-bottom:8px;font-size:14px}
+.btnrow{display:flex;gap:10px}
+.btnrow button{flex:1}
+button.deny{background:#eee;color:#555}
+</style></head><body>
+<div class="card">
+  <div class="logo">🔐 Access-Nex</div><div class="sub">Authorization Request</div>
+  <h1>` + esc(client.Name) + ` wants access to:</h1>
+  <p class="hint">Signed in as <strong>` + esc(username) + `</strong></p>
+  <ul class="scopes">` + scopeItems + `</ul>
+  <form method="post" action="/authorize">` + hidden + `
+    <div class="btnrow">
+      <button type="submit" name="consent" value="approve">Allow</button>
+      <button type="submit" name="consent" value="deny" class="deny">Deny</button>
+    </div>
+  </form>
+  <div class="footer">Your decision is remembered for this application.</div>
+</div></body></html>`
+	w.Header().Set("Content-Type", "text/html; charset=utf-8")
+	w.Write([]byte(page))
 }
