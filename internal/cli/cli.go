@@ -62,7 +62,7 @@ func init() {
 	rootCmd.PersistentFlags().StringVar(&configDir, "config", defaultConfigDir,
 		"config directory (holds the SQLite database and key files)")
 
-	rootCmd.AddCommand(userCmd, appCmd, providerCmd, serverCmd, shutdownCmd)
+	rootCmd.AddCommand(userCmd, appCmd, providerCmd, serverCmd, shutdownCmd, migrateCmd)
 
 	// user
 	userCmd.AddCommand(userAddCmd, userListCmd, userDeleteCmd)
@@ -703,6 +703,17 @@ var serverCmd = &cobra.Command{
 		}
 
 		srv := server.New(issuer, key, st, box)
+
+		// Purge expired codes, tokens, and sessions in the background.
+		go func() {
+			ticker := time.NewTicker(10 * time.Minute)
+			defer ticker.Stop()
+			for range ticker.C {
+				if err := st.CleanupExpired(); err != nil {
+					fmt.Printf("cleanup: %v\n", err)
+				}
+			}
+		}()
 
 		fmt.Printf("\n✓ OIDC/OAuth2 provider starting on %s\n", addr)
 		fmt.Printf("  Issuer:          %s\n", issuer)

@@ -69,6 +69,45 @@ CREATE TABLE IF NOT EXISTS applications (
 
 CREATE INDEX IF NOT EXISTS idx_users_provider ON users(provider_id);
 CREATE INDEX IF NOT EXISTS idx_apps_provider  ON applications(provider_id);
+
+-- Runtime state: persisted so logins, codes, and tokens survive restarts.
+CREATE TABLE IF NOT EXISTS auth_codes (
+    code                  TEXT PRIMARY KEY,
+    client_id             TEXT NOT NULL,
+    redirect_uri          TEXT NOT NULL DEFAULT '',
+    subject               TEXT NOT NULL,
+    scopes                TEXT NOT NULL DEFAULT '',
+    nonce                 TEXT NOT NULL DEFAULT '',
+    code_challenge        TEXT NOT NULL DEFAULT '',
+    code_challenge_method TEXT NOT NULL DEFAULT '',
+    auth_time             TEXT NOT NULL,
+    expires_at            TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS access_tokens (
+    token      TEXT PRIMARY KEY,
+    jti        TEXT NOT NULL,
+    client_id  TEXT NOT NULL,
+    subject    TEXT NOT NULL,
+    scopes     TEXT NOT NULL DEFAULT '',
+    expires_at TEXT NOT NULL,
+    revoked    INTEGER NOT NULL DEFAULT 0
+);
+
+CREATE TABLE IF NOT EXISTS refresh_tokens (
+    token      TEXT PRIMARY KEY,
+    client_id  TEXT NOT NULL,
+    subject    TEXT NOT NULL,
+    scopes     TEXT NOT NULL DEFAULT '',
+    expires_at TEXT NOT NULL,
+    revoked    INTEGER NOT NULL DEFAULT 0
+);
+
+CREATE TABLE IF NOT EXISTS sessions (
+    id         TEXT PRIMARY KEY,
+    subject    TEXT NOT NULL,
+    expires_at TEXT NOT NULL
+);
 `
 
 // Open creates the config directory if needed, opens (or creates) the SQLite

@@ -1,11 +1,12 @@
 // Package server implements the HTTP OIDC/OAuth2 provider. Users, providers,
-// and applications are read from the SQL store; short-lived runtime state
-// (auth codes, tokens, sessions, in-flight external logins) is kept in memory.
+// applications, sessions, auth codes, and tokens are all persisted in the SQL
+// store; only in-flight external-provider logins are kept in memory.
 package server
 
 import (
 	"crypto/rsa"
 	"crypto/subtle"
+	"log"
 	"net/http"
 	"sync"
 	"time"
@@ -26,26 +27,18 @@ type Server struct {
 	store  *store.Store
 	box    *secrets.Box
 
-	mu            sync.Mutex
-	authCodes     map[string]*models.AuthCode
-	accessTokens  map[string]*models.TokenRecord
-	refreshTokens map[string]*models.RefreshRecord
-	sessions      map[string]*models.Session
-	oauthStates   map[string]*models.OAuthProxyState
+	mu          sync.Mutex
+	oauthStates map[string]*models.OAuthProxyState
 }
 
 func New(issuer string, key *rsa.PrivateKey, st *store.Store, box *secrets.Box) *Server {
 	return &Server{
-		issuer:        issuer,
-		key:           key,
-		keyID:         "access-nex-key-1",
-		store:         st,
-		box:           box,
-		authCodes:     make(map[string]*models.AuthCode),
-		accessTokens:  make(map[string]*models.TokenRecord),
-		refreshTokens: make(map[string]*models.RefreshRecord),
-		sessions:      make(map[string]*models.Session),
-		oauthStates:   make(map[string]*models.OAuthProxyState),
+		issuer:      issuer,
+		key:         key,
+		keyID:       "access-nex-key-1",
+		store:       st,
+		box:         box,
+		oauthStates: make(map[string]*models.OAuthProxyState),
 	}
 }
 
@@ -149,14 +142,15 @@ func (s *Server) authenticateClient(r *http.Request) (*models.App, string) {
 	return client, ""
 }
 
-// ── Session helpers ───────────────────────────────────────────────────────────
+// ── Session helpers (persisted in the sessions table) ─────────────────────────
 
 func (s *Server) startSession(w http.ResponseWriter, subject string) {
 	sessionID := secrets.RandomToken(32)
 	expires := time.Now().Add(8 * time.Hour)
-	s.mu.Lock()
-	s.sessions[sessionID] = &models.Session{ID: sessionID, Subject: subject, ExpiresAt: expires}
-	s.mu.Unlock()
+	if err := s.store.SaveSession(&models.Session{ID: sessionID, Subject: subject, ExpiresAt: expires}); err != nil {
+		log.Printf("save session: %v", err)
+		return
+	}
 	http.SetCookie(w, &http.Cookie{
 		Name:     sessionCookie,
 		Value:    sessionID,
@@ -169,9 +163,9 @@ func (s *Server) startSession(w http.ResponseWriter, subject string) {
 
 func (s *Server) endSession(w http.ResponseWriter, r *http.Request) {
 	if cookie, err := r.Cookie(sessionCookie); err == nil {
-		s.mu.Lock()
-		delete(s.sessions, cookie.Value)
-		s.mu.Unlock()
+		if err := s.store.DeleteSession(cookie.Value); err != nil {
+			log.Printf("delete session: %v", err)
+		}
 	}
 	http.SetCookie(w, &http.Cookie{
 		Name: sessionCookie, Value: "", Path: "/", MaxAge: -1,
@@ -184,14 +178,12 @@ func (s *Server) subjectFromSession(r *http.Request) (string, bool) {
 	if err != nil {
 		return "", false
 	}
-	s.mu.Lock()
-	session := s.sessions[cookie.Value]
-	if session != nil && time.Now().After(session.ExpiresAt) {
-		delete(s.sessions, cookie.Value)
-		session = nil
+	session, err := s.store.GetSession(cookie.Value)
+	if err != nil {
+		return "", false
 	}
-	s.mu.Unlock()
-	if session == nil {
+	if time.Now().After(session.ExpiresAt) {
+		_ = s.store.DeleteSession(cookie.Value)
 		return "", false
 	}
 	return session.Subject, true

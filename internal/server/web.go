@@ -9,7 +9,6 @@ import (
 	"log"
 	"net/http"
 	"strings"
-	"time"
 )
 
 const pageStyle = `<style>
@@ -181,21 +180,10 @@ func (s *Server) handlePortal(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	now := time.Now()
-	s.mu.Lock()
-	activeTokens := 0
-	for _, t := range s.accessTokens {
-		if !t.Revoked && now.Before(t.ExpiresAt) {
-			activeTokens++
-		}
+	activeSessions, activeTokens, err := s.store.CountActive()
+	if err != nil {
+		log.Printf("portal: count active: %v", err)
 	}
-	activeSessions := 0
-	for _, sess := range s.sessions {
-		if now.Before(sess.ExpiresAt) {
-			activeSessions++
-		}
-	}
-	s.mu.Unlock()
 
 	apps, _ := s.store.ListApps()
 	appOptions := `<option value="">— select an app —</option>`

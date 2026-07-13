@@ -144,14 +144,16 @@ func (s *Server) issueAuthorizationCode(w http.ResponseWriter, r *http.Request, 
 	if len(scope) == 0 {
 		scope = []string{"openid"}
 	}
-	s.mu.Lock()
-	s.authCodes[code] = &models.AuthCode{
+	err := s.store.SaveAuthCode(&models.AuthCode{
 		Code: code, ClientID: req.ClientID, RedirectURI: req.RedirectURI,
 		Subject: subject, Scope: scope, Nonce: req.Nonce,
 		CodeChallenge: req.CodeChallenge, CodeChallengeMethod: req.CodeChallengeMethod,
 		ExpiresAt: time.Now().Add(5 * time.Minute), AuthTime: time.Now(),
+	})
+	if err != nil {
+		s.redirectWithOAuthError(w, r, req.RedirectURI, "server_error", "Could not issue code", req.State)
+		return
 	}
-	s.mu.Unlock()
 	redirectURL, _ := url.Parse(req.RedirectURI)
 	q := redirectURL.Query()
 	q.Set("code", code)
@@ -211,13 +213,8 @@ func (s *Server) handleAuthorizationCodeGrant(w http.ResponseWriter, r *http.Req
 		writeOAuthError(w, http.StatusBadRequest, "invalid_request", "Missing code")
 		return
 	}
-	s.mu.Lock()
-	code := s.authCodes[codeValue]
-	if code != nil {
-		delete(s.authCodes, codeValue)
-	}
-	s.mu.Unlock()
-	if code == nil || time.Now().After(code.ExpiresAt) {
+	code, err := s.store.ConsumeAuthCode(codeValue)
+	if err != nil || time.Now().After(code.ExpiresAt) {
 		writeOAuthError(w, http.StatusBadRequest, "invalid_grant", "Invalid or expired code")
 		return
 	}
@@ -251,14 +248,9 @@ func (s *Server) handleRefreshTokenGrant(w http.ResponseWriter, r *http.Request,
 		writeOAuthError(w, http.StatusBadRequest, "invalid_request", "Missing refresh_token")
 		return
 	}
-	s.mu.Lock()
-	refresh := s.refreshTokens[refreshToken]
-	valid := refresh != nil && !refresh.Revoked && refresh.ClientID == client.ID && time.Now().Before(refresh.ExpiresAt)
-	if valid {
-		refresh.Revoked = true // single-use: rotate on every refresh
-	}
-	s.mu.Unlock()
-	if !valid {
+	// Single-use: the store validates and revokes the token in one step.
+	refresh, err := s.store.ConsumeRefreshToken(refreshToken, client.ID)
+	if err != nil {
 		writeOAuthError(w, http.StatusBadRequest, "invalid_grant", "Invalid refresh_token")
 		return
 	}
@@ -314,12 +306,13 @@ func (s *Server) issueTokenResponse(clientID, subject string, scope []string, no
 	if includeRefresh && hasScope(scope, "offline_access") {
 		refreshToken := secrets.RandomToken(48)
 		expires := time.Now().Add(30 * 24 * time.Hour)
-		s.mu.Lock()
-		s.refreshTokens[refreshToken] = &models.RefreshRecord{
+		err := s.store.SaveRefreshToken(&models.RefreshRecord{
 			Token: refreshToken, ClientID: clientID, Subject: subject,
 			Scope: scope, ExpiresAt: expires,
+		})
+		if err != nil {
+			return nil, err
 		}
-		s.mu.Unlock()
 		resp["refresh_token"] = refreshToken
 	}
 	return resp, nil
@@ -339,9 +332,9 @@ func (s *Server) issueAccessToken(clientID, subject string, scope []string) (*mo
 		return nil, err
 	}
 	record := &models.TokenRecord{Token: token, JTI: jti, ClientID: clientID, Subject: subject, Scope: scope, ExpiresAt: expires}
-	s.mu.Lock()
-	s.accessTokens[token] = record
-	s.mu.Unlock()
+	if err := s.store.SaveAccessToken(record); err != nil {
+		return nil, err
+	}
 	return record, nil
 }
 
@@ -405,14 +398,10 @@ func (s *Server) handleRevoke(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	token := r.Form.Get("token")
-	s.mu.Lock()
-	if a := s.accessTokens[token]; a != nil && a.ClientID == client.ID {
-		a.Revoked = true
+	if err := s.store.RevokeToken(token, client.ID); err != nil {
+		writeOAuthError(w, http.StatusInternalServerError, "server_error", "Could not revoke token")
+		return
 	}
-	if rf := s.refreshTokens[token]; rf != nil && rf.ClientID == client.ID {
-		rf.Revoked = true
-	}
-	s.mu.Unlock()
 	w.WriteHeader(http.StatusOK)
 }
 
@@ -433,10 +422,8 @@ func (s *Server) handleIntrospect(w http.ResponseWriter, r *http.Request) {
 	}
 	token := r.Form.Get("token")
 	now := time.Now()
-	s.mu.Lock()
-	access := s.accessTokens[token]
-	refresh := s.refreshTokens[token]
-	s.mu.Unlock()
+	access, _ := s.store.GetAccessToken(token)
+	refresh, _ := s.store.GetRefreshToken(token)
 	if access != nil && !access.Revoked && now.Before(access.ExpiresAt) {
 		writeJSON(w, http.StatusOK, map[string]any{
 			"active": true, "scope": strings.Join(access.Scope, " "),
@@ -464,10 +451,8 @@ func (s *Server) handleUserInfo(w http.ResponseWriter, r *http.Request) {
 		writeOAuthError(w, http.StatusUnauthorized, "invalid_token", "Missing bearer token")
 		return
 	}
-	s.mu.Lock()
-	record := s.accessTokens[token]
-	s.mu.Unlock()
-	if record == nil || record.Revoked || time.Now().After(record.ExpiresAt) {
+	record, err := s.store.GetAccessToken(token)
+	if err != nil || record.Revoked || time.Now().After(record.ExpiresAt) {
 		w.Header().Set("WWW-Authenticate", `Bearer realm="userinfo", error="invalid_token"`)
 		writeOAuthError(w, http.StatusUnauthorized, "invalid_token", "Invalid or expired token")
 		return

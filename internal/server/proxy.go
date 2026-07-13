@@ -203,8 +203,7 @@ func (s *Server) handleOAuthCallback(w http.ResponseWriter, r *http.Request) {
 	}
 
 	localCode := secrets.RandomToken(32)
-	s.mu.Lock()
-	s.authCodes[localCode] = &models.AuthCode{
+	err = s.store.SaveAuthCode(&models.AuthCode{
 		Code:        localCode,
 		ClientID:    pending.ClientID,
 		RedirectURI: pending.RedirectURI,
@@ -213,8 +212,12 @@ func (s *Server) handleOAuthCallback(w http.ResponseWriter, r *http.Request) {
 		Nonce:       pending.Nonce,
 		ExpiresAt:   time.Now().Add(5 * time.Minute),
 		AuthTime:    time.Now(),
+	})
+	if err != nil {
+		log.Printf("oauth callback: save code: %v", err)
+		http.Error(w, "failed to issue code", http.StatusInternalServerError)
+		return
 	}
-	s.mu.Unlock()
 
 	redir, _ := url.Parse(pending.RedirectURI)
 	rq := redir.Query()
