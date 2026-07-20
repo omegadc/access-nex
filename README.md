@@ -1,20 +1,25 @@
 # Access-Nex: OIDC/OAuth2 Provider
 
-A self-hosted OpenID Connect (OIDC) and OAuth 2.0 provider with a management CLI. Register applications, manage users, and federate sign-in through external identity providers (Google, Microsoft, GitHub, Discord, Okta, or any custom OAuth2/OIDC provider). Data is stored in SQLite (zero-config) or PostgreSQL.
+A self-hosted OpenID Connect (OIDC) and OAuth 2.0 provider with a management CLI. Register applications, manage users, and federate sign-in through external identity providers (Google, Microsoft, GitHub, Discord, Okta, or any custom OAuth2/OIDC provider). Data is stored in SQLite (zero-config) or PostgreSQL. Ships as a container ([Dockerfile](Dockerfile), [docker-compose.yml](docker-compose.yml)) and exposes a full JSON API so its built-in web UI can be swapped for a custom frontend (see [docs/FRONTEND.md](docs/FRONTEND.md)).
 
 ## Project Structure
 
 ```
 access-nex/
 ├── main.go                     # Program entry point (starts the CLI)
+├── Dockerfile, docker-compose.yml, .dockerignore
+├── docs/
+│   ├── openapi.yaml             # Full HTTP API contract
+│   └── FRONTEND.md              # How to swap the built-in HTML frontend for a custom one
 ├── go.mod / go.sum
 ├── internal/
 │   ├── cli/
-│   │   ├── cli.go              # Cobra command tree (user/app/provider/server)
+│   │   ├── cli.go              # Cobra command tree (user/app/provider/server), SMTP + logging flags
 │   │   ├── migrate.go          # `migrate` command: legacy JSON → SQL import
 │   │   ├── keys.go             # Signing-key loading + rotate/list/retire commands
 │   │   ├── admin.go            # user promote/demote, audit log viewer
-│   │   └── groups.go           # group create/list/delete/add-member/remove-member
+│   │   ├── groups.go           # group create/list/delete/add-member/remove-member
+│   │   └── logging.go          # --log-format/--log-level → log/slog logger
 │   ├── database/
 │   │   ├── database.go         # Opens SQLite or PostgreSQL, dialect-aware placeholder rebinding
 │   │   └── schema.go           # CREATE TABLE script + column migrations (both backends)
@@ -29,29 +34,37 @@ access-nex/
 │   │   ├── identities.go       #   linked external identities
 │   │   ├── groups.go           #   groups / group_members
 │   │   ├── device.go           #   device_codes table (RFC 8628)
+│   │   ├── reset.go            #   password_resets / email_verifications tables
+│   │   ├── webauthn.go         #   webauthn_credentials table
 │   │   └── audit.go            #   audit_log table
 │   ├── server/                 # HTTP OIDC/OAuth2 provider
-│   │   ├── server.go           #   routes, sessions, lockout, per-client CORS
+│   │   ├── server.go           #   routes, sessions, lockout, per-client + frontend CORS
 │   │   ├── oidc.go             #   /authorize /token /userinfo /introspect /revoke /register ...
 │   │   ├── proxy.go            #   external-provider SSO proxy (/oauth/start, /oauth/callback)
 │   │   ├── web.go              #   dashboard, login form, consent screen, portal
+│   │   ├── apiv1.go            #   /api/v1 JSON account API (for a custom frontend)
 │   │   ├── totp_ui.go          #   2FA enrollment (QR) + login challenge pages
+│   │   ├── webauthn.go         #   passkey/security-key registration + login (FIDO2)
 │   │   ├── portal_self.go      #   self-service: password, grants, sessions, identities
+│   │   ├── reset.go            #   forgot/reset password, email verification
 │   │   ├── device.go           #   RFC 8628 device authorization grant
 │   │   ├── tokenexchange.go    #   RFC 8693 token exchange
-│   │   ├── dpop.go             #   RFC 9449 DPoP proof validation + JWK thumbprint
+│   │   ├── dpop.go             #   RFC 9449 DPoP proof validation + server-issued nonce
 │   │   ├── logout.go           #   back-channel + front-channel logout notification
 │   │   ├── admin.go            #   /admin UI + /api/admin/* JSON API
+│   │   ├── metrics.go          #   Prometheus /metrics
 │   │   ├── ratelimit.go        #   per-IP rate limiting
 │   │   ├── jwe.go              #   ID-token encryption (RSA-OAEP-256 + A256GCM)
 │   │   └── helpers.go          #   JSON/PKCE/scope utilities
 │   ├── models/models.go        # Shared types + built-in provider templates
+│   ├── email/email.go          # SMTP mailer, with a file-logging fallback when unconfigured
 │   └── secrets/                # AES-GCM encryption, RSA key gen, TOTP, self-signed TLS certs
 └── .access-nex/                # Local runtime data (gitignored) — always used for the AES
-                                 # box key and legacy signing key, regardless of DB backend
+                                 # box key and signing key, regardless of DB backend
     ├── access-nex.db           #   SQLite database (unless --db points at PostgreSQL)
     ├── secret.key              #   AES key encrypting provider client secrets + signing keys
-    └── signing.pem             #   legacy RSA signing key (imported into signing_keys on first run)
+    ├── signing.pem             #   legacy RSA signing key (imported into signing_keys on first run)
+    └── outbox.log               #   emails written here when no --smtp-host is configured
 ```
 
 ## Database
@@ -59,13 +72,13 @@ access-nex/
 Two backends, selected by `--db`:
 
 - **SQLite (default)** — a file inside `--config` (default `.access-nex/`), pure Go (`modernc.org/sqlite`), no C compiler needed. Zero configuration.
-- **PostgreSQL** — pass `--db postgres://user:pass@host/dbname?sslmode=disable`. Useful for multi-instance deployments (SQLite allows only one writer process). The store layer writes ordinary `?`-placeholder SQL; [internal/database/database.go](internal/database/database.go) rebinds it to `$1, $2, ...` and adapts a couple of driver differences (e.g. boolean encoding) transparently — no query text differs between backends.
+- **PostgreSQL** — pass `--db postgres://user:pass@host/dbname?sslmode=disable`. Useful for multi-instance deployments (SQLite allows only one writer process) — it's also what [docker-compose.yml](docker-compose.yml) uses by default, since `docker exec` admin commands against a container's own SQLite file aren't reliably visible to the running server on every Docker volume backend, while PostgreSQL (a real client-server database) has no such issue. The store layer writes ordinary `?`-placeholder SQL; [internal/database/database.go](internal/database/database.go) rebinds it to `$1, $2, ...` and adapts a couple of driver differences (e.g. boolean encoding) transparently — no query text differs between backends.
 
-Either way, `--config DIR` still selects where the AES box key and legacy signing key files live.
+Either way, `--config DIR` still selects where the AES box key and signing key files live.
 
 | Table            | Contents |
 |------------------|----------|
-| `users`          | Local accounts (bcrypt hashes, optional TOTP secret, lockout state, admin flag) and accounts provisioned from external providers |
+| `users`          | Local accounts (bcrypt hashes, optional TOTP secret, email verification, lockout state, admin flag) and accounts provisioned from external providers |
 | `providers`      | One `internal` row for the local issuer, plus external OAuth2/OIDC providers with encrypted client secrets |
 | `applications`   | Registered OAuth2/OIDC clients: redirect URIs, scopes, ID-token encryption key, logout URIs |
 | `auth_codes`     | Single-use authorization codes |
@@ -75,6 +88,8 @@ Either way, `--config DIR` still selects where the AES box key and legacy signin
 | `grants`         | Remembered consent decisions per user + application |
 | `signing_keys`   | JWT signing keys (encrypted); one active, older keys stay in JWKS |
 | `identities`     | External identities linked to local users (account linking) |
+| `webauthn_credentials` | Registered passkeys/security keys |
+| `password_resets` / `email_verifications` | Single-use, expiring tokens for those flows |
 | `device_codes`   | RFC 8628 device authorization flow state |
 | `groups` / `group_members` | Roles/teams, exposed as the `groups` claim |
 | `audit_log`      | Security events: logins, consent, token issuance, admin actions, key rotation |
@@ -94,21 +109,20 @@ Imports the pre-SQL `users.json` / `apps.json` / `providers.json` files if prese
 ```bash
 go build -o access-nex .
 
-# 1. Initialize the local provider
-./access-nex provider self init --issuer http://localhost:8080
-
-# 2. Create a user
+# 1. Create a user
 ./access-nex user add -u alice -p secret123 -e alice@example.com -n "Alice Example"
 
-# 3. Register an application
+# 2. Register an application
 ./access-nex app create -n "My App" -r http://localhost:9000/
 
-# 4. (Optional) Add an external provider from a template
+# 3. (Optional) Add an external provider from a template
 ./access-nex provider add -n "Google SSO" -t google -c GOOGLE_CLIENT_ID -s GOOGLE_CLIENT_SECRET
 
-# 5. Start the server
+# 4. Start the server (auto-initializes the local provider on first run)
 ./access-nex server --addr :8080
 ```
+
+Or with Docker: `docker compose up -d` (see [docker-compose.yml](docker-compose.yml) for first-time setup commands).
 
 Open http://localhost:8080 for the dashboard, or http://localhost:8080/login to sign in and get ready-to-paste OAuth client configuration (e.g. for Portainer).
 
@@ -116,12 +130,12 @@ Open http://localhost:8080 for the dashboard, or http://localhost:8080/login to 
 
 | Command | Description |
 |---------|-------------|
-| `user add/list/delete` | Manage local users (bcrypt hashes; `--admin` grants admin rights) |
+| `user add/list/delete` | Manage local users (bcrypt hashes; `--admin` grants admin rights, `--verified` marks the email pre-verified) |
 | `user promote/demote` | Grant or revoke admin rights (access to `/admin`) |
 | `app create/list/show/update/delete` | Manage OAuth2/OIDC client applications |
 | `app update --id-token-enc-key key.pem` | Encrypt ID tokens (JWE) for this client |
 | `app update --backchannel-logout-uri / --frontchannel-logout-uri` | Register logout notification endpoints |
-| `provider self init/info` | Initialize/inspect the local OIDC provider |
+| `provider self init/info` | Initialize/inspect the local OIDC provider (also happens automatically on first `server` start) |
 | `provider self rotate-key/list-keys/retire-key` | JWT signing-key rotation with kid rollover |
 | `provider add/list/show/update/delete` | Manage external providers (`-t google\|github\|microsoft\|discord\|okta\|custom`) |
 | `group create/list/delete` | Manage groups/roles |
@@ -129,12 +143,18 @@ Open http://localhost:8080 for the dashboard, or http://localhost:8080/login to 
 | `audit -n 50` | Show recent audit log entries |
 | `migrate` | Import legacy JSON data into SQL |
 | `server --addr :8080` | Run the HTTP provider |
+| `server --issuer URL` | Issuer to auto-initialize with, if not already set (default `http://localhost:8080`) |
 | `server --tls-cert/--tls-key` | Serve HTTPS with your own certificate |
 | `server --tls-self-signed` | Serve HTTPS with an in-memory self-signed cert (dev/local) |
+| `server --dpop-require-nonce` | Require a server-issued nonce in DPoP proofs (RFC 9449 §8) |
+| `server --frontend-origin URL` | Extra CORS origin(s) for a separately-hosted frontend (repeatable) |
+| `server --log-format text\|json --log-level debug\|info\|warn\|error` | Structured logging |
 
-Global flags: `--config DIR` (default `.access-nex`, holds the AES/signing keys and the SQLite file), `--db DSN` (use PostgreSQL instead of SQLite).
+Global flags: `--config DIR` (default `.access-nex`, holds the AES/signing keys and the SQLite file), `--db DSN` (use PostgreSQL instead of SQLite), `--smtp-host/--smtp-port/--smtp-username/--smtp-password/--smtp-from` (outgoing mail for password reset/verification; omit `--smtp-host` to write mail to `--config/outbox.log` instead of sending it — handy for local/dev use).
 
 ## Server Endpoints
+
+The full contract, including request/response bodies, is in [docs/openapi.yaml](docs/openapi.yaml).
 
 | Endpoint | Purpose |
 |----------|---------|
@@ -147,24 +167,31 @@ Global flags: `--config DIR` (default `.access-nex`, holds the AES/signing keys 
 | `POST /register` | RFC 7591 dynamic client registration (persisted to SQL) |
 | `POST /device_authorize`, `GET/POST /device` | RFC 8628 device authorization grant |
 | `GET /oauth/providers`, `/oauth/start`, `/oauth/callback` | External-provider SSO proxy |
-| `GET /`, `/login`, `/portal`, `/apps` | Web UI |
+| `POST /api/v1/*` | JSON account API (login, 2FA, password, sessions, grants, identities) for a custom frontend |
+| `POST /portal/webauthn/*`, `/login/webauthn/*` | Passkey/security-key registration and login (JSON) |
 | `GET /admin`, `/api/admin/*` | Admin console + JSON API (requires an admin user) |
+| `GET /metrics` | Prometheus metrics |
+| `GET /`, `/login`, `/portal`, `/apps`, `/forgot-password`, `/reset-password`, `/verify-email` | Web UI |
 
 ### Consent
 
 After login, users see a consent screen ("App X wants access to: profile, email…"). Approvals are stored in the `grants` table and skipped on later logins. `prompt=consent` forces the screen again; `prompt=login`/`select_account` force re-authentication; `prompt=none` fails with `login_required`/`consent_required` when interaction would be needed. `response_mode=form_post` is supported.
 
-### Two-factor authentication (TOTP)
+### Two-factor authentication: TOTP and passkeys
 
-From the portal (`/portal/2fa`), a user can enable TOTP: a QR code (RFC 6238, compatible with Google Authenticator, Authy, 1Password, etc.) is shown alongside the raw secret, and a confirmation code is required before it activates. Once enabled, both `/login` and `/authorize` insert a second "enter your code" step after the password, backed by a short-lived server-side pending-login token (no third-party TOTP library — implemented directly against stdlib crypto in [internal/secrets/totp.go](internal/secrets/totp.go)).
+From the portal (`/portal/2fa`), a user can enable **TOTP** (a QR code, RFC 6238, compatible with Google Authenticator/Authy/1Password — implemented directly against stdlib crypto, no third-party TOTP library) and/or register **passkeys/security keys** (FIDO2/WebAuthn — YubiKeys, Windows Hello, Touch ID; delegated to `github.com/go-webauthn/webauthn` since the CBOR/COSE/attestation parsing genuinely warrants a well-audited dependency). Both `/login` and `/authorize` insert a second step after the password when either is enrolled, offering whichever method(s) are available; a security-key login is verified with the same challenge/response flow a browser drives via `navigator.credentials.get()`.
 
 ### Portal self-service
 
 Signed-in users manage their own account at `/portal`:
-- **Security** — change password, enable/disable 2FA
+- **Security** — change password, enable/disable 2FA (TOTP + passkeys), resend the email verification link
 - **Authorized Applications** — see and revoke consent grants
 - **Active Sessions** — see and end sessions on other devices (current device is flagged)
 - **Linked Accounts** — see and unlink external identities (blocked if it's the only sign-in method and no password is set, to prevent lockout)
+
+### Password reset & email verification
+
+`/forgot-password` emails a single-use, 1-hour reset link (the response is identical whether or not the address matched an account, to avoid leaking who has one). New local accounts start unverified unless created with `--verified`; `/portal` shows a banner with a resend button, and `/verify-email?token=...` confirms it. Without `--smtp-host` configured, mail is written to `--config/outbox.log` instead of sent — the whole flow works end-to-end without any mail server for local/dev use.
 
 ### Account linking
 
@@ -198,7 +225,7 @@ The subject is preserved; scope can only be narrowed, never widened. The issued 
 
 ### DPoP — sender-constrained tokens (RFC 9449)
 
-A client that generates an EC (P-256) or RSA key pair and sends a signed `DPoP` proof header on `/token` gets back a token bound to that key (`cnf.jkt` claim, `token_type: DPoP`). Using it later (e.g. at `/userinfo`) requires the `Authorization: DPoP <token>` scheme plus a fresh matching proof — a stolen bearer token alone isn't enough. Implemented directly against stdlib crypto ([internal/server/dpop.go](internal/server/dpop.go)), no JOSE dependency.
+A client that generates an EC (P-256) or RSA key pair and sends a signed `DPoP` proof header on `/token` gets back a token bound to that key (`cnf.jkt` claim, `token_type: DPoP`). Using it later (e.g. at `/userinfo`) requires the `Authorization: DPoP <token>` scheme plus a fresh matching proof — a stolen bearer token alone isn't enough. With `server --dpop-require-nonce`, the server also demands a server-issued nonce in each proof (RFC 9449 §8): the first proof without one is rejected with `use_dpop_nonce` and a `DPoP-Nonce` response header, the client retries with it, and every subsequent response proactively carries the next nonce so a well-behaved client only pays that round trip once. Implemented directly against stdlib crypto ([internal/server/dpop.go](internal/server/dpop.go)), no JOSE dependency.
 
 ### Groups claim
 
@@ -212,21 +239,34 @@ Give a user admin rights (`access-nex user promote -u alice` or `user add --admi
 
 `/oauth/start?provider_id=X&client_id=Y&redirect_uri=Z` redirects the user to the external provider. After the user signs in, `/oauth/callback` exchanges the provider's code, fetches userinfo, creates (or links) a row in the `users` table, and redirects back to the app with a **local** authorization code that the app exchanges at `/token` like any other login.
 
-## HTTPS
+## Swapping the frontend
+
+The server-rendered HTML pages (`/login`, `/portal`, `/admin`, `/device`) are optional — everything they do is also reachable as JSON under `/api/v1` (account management), `/api/admin` (admin), and the WebAuthn endpoints. A custom frontend, in Python or anything else, can replace them entirely without touching the Go server. See [docs/FRONTEND.md](docs/FRONTEND.md) for the recommended topology (same-origin via reverse proxy, or a cross-origin SPA with `--frontend-origin`) and [docs/openapi.yaml](docs/openapi.yaml) for the full contract.
+
+## Observability
+
+- **Structured logs**: `server --log-format json --log-level info` (stdlib `log/slog`).
+- **Metrics**: `GET /metrics` (Prometheus text format) — HTTP request counts/latency by route, login outcomes, tokens issued by grant type, DPoP rejections. Unauthenticated by design (standard Prometheus practice); keep it off the public internet at the network/reverse-proxy layer.
+- **Audit log**: `access-nex audit` or `/api/admin/audit` — logins, consent, token issuance, admin actions, key rotation, and more, persisted in SQL.
+
+## Docker
 
 ```bash
-./access-nex server --tls-cert cert.pem --tls-key key.pem   # your own certificate
-./access-nex server --tls-self-signed                       # in-memory self-signed cert (dev/local)
+docker compose up -d
+docker compose exec access-nex access-nex --db "$ACCESS_NEX_DB" user add -u admin -p CHANGE_ME --admin --verified
+docker compose exec access-nex access-nex --db "$ACCESS_NEX_DB" app create -n "My App" -r https://your-app/callback
 ```
 
-Set the issuer to `https://...` (`provider self init --issuer https://...`) when serving TLS — that's what flips cookies to `Secure` and is checked at server startup.
+[docker-compose.yml](docker-compose.yml) runs access-nex + PostgreSQL (see [Database](#database) for why Postgres, not SQLite, is the compose default). The image is a multi-stage build ([Dockerfile](Dockerfile)) producing a fully static binary (`CGO_ENABLED=0`, pure-Go SQLite/Postgres drivers) on `gcr.io/distroless/static-debian12:nonroot` — no shell, no package manager, runs as a non-root user. The local provider auto-initializes on first `server` start, so no separate init step is needed in a container that has no shell to script one with.
+
+On the same Docker network, other containers (Portainer, your app) reach access-nex at `http://access-nex:8080` directly — no `host.docker.internal` workaround needed there, unlike when access-nex runs as a bare process on the host (see below).
 
 ## Connecting Portainer (or any Dockerized client)
 
 Portainer's OAuth settings make **two kinds** of requests:
 
 - **Browser-side** (Authorization URL, Logout URL) — resolved on *your* machine, so `localhost:8080` works.
-- **Server-side** (Access Token URL, Resource URL) — made from *inside the Portainer container*, where `localhost` is the container itself. Use `host.docker.internal` instead.
+- **Server-side** (Access Token URL, Resource URL) — made from *inside the Portainer container*, where `localhost` is the container itself. Use `host.docker.internal` instead (or, if both are Docker containers on the same compose network, the access-nex service name — see [Docker](#docker) above).
 
 Working configuration for Portainer at `https://localhost:9443`:
 
@@ -247,4 +287,4 @@ If authentication fails, check `docker logs portainer` — OAuth errors (connect
 
 ## Security Notes
 
-Suitable for development, internal tooling, and small deployments. Implemented: bcrypt password hashes with 5-attempt/15-minute lockout, optional TOTP 2FA, AES-256-GCM encryption of provider secrets and signing keys at rest, RS256 JWTs with key rotation, single-use auth codes and refresh tokens with reuse detection (family revocation), DPoP sender-constrained tokens, per-IP rate limiting on `/token` and logins, per-client CORS, Secure cookies over HTTPS, consent with remembered grants, back-channel/front-channel logout, and an audit log. Still open: email verification for local accounts, and DPoP nonce/replay protection is proof-freshness-window based rather than server-issued-nonce based (RFC 9449 §8 optional feature).
+Suitable for development, internal tooling, and small deployments. Implemented: bcrypt password hashes with 5-attempt/15-minute lockout, TOTP 2FA and FIDO2/WebAuthn passkeys, AES-256-GCM encryption of provider secrets and signing keys at rest, RS256 JWTs with key rotation, single-use auth codes and refresh tokens with reuse detection (family revocation), DPoP sender-constrained tokens with optional server-issued nonces, per-IP rate limiting on `/token` and logins, per-client CORS, Secure cookies over HTTPS, consent with remembered grants, back-channel/front-channel logout, password reset and email verification, and a full audit log.

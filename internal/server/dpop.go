@@ -26,6 +26,8 @@ import (
 	"net/http"
 	"strings"
 	"time"
+
+	"github.com/omegadc/access-nex/internal/secrets"
 )
 
 const dpopProofMaxAge = 5 * time.Minute
@@ -46,12 +48,20 @@ type dpopHeader struct {
 }
 
 type dpopClaims struct {
-	JTI string `json:"jti"`
-	HTM string `json:"htm"`
-	HTU string `json:"htu"`
-	IAT int64  `json:"iat"`
-	Ath string `json:"ath,omitempty"`
+	JTI   string `json:"jti"`
+	HTM   string `json:"htm"`
+	HTU   string `json:"htu"`
+	IAT   int64  `json:"iat"`
+	Ath   string `json:"ath,omitempty"`
+	Nonce string `json:"nonce,omitempty"`
 }
+
+// errDPoPNonceRequired signals that the server requires (RFC 9449 §8) a
+// server-issued nonce in the proof and the presented proof either had none
+// or had a stale/already-used one. Callers respond 400 use_dpop_nonce with
+// a freshly issued nonce in the DPoP-Nonce header, rather than a bare
+// invalid_dpop_proof — the client is expected to retry once, not give up.
+var errDPoPNonceRequired = errors.New("dpop nonce required")
 
 // thumbprint computes the RFC 7638 JWK thumbprint: SHA-256 over the JSON
 // object of *required* members only, keys in lexicographic order, no
@@ -185,6 +195,11 @@ func (s *Server) verifyDPoPProof(proof, method, url string) (jkt string, err err
 	if claims.JTI == "" || s.dpopJTISeen(claims.JTI) {
 		return "", errors.New("proof jti missing or replayed")
 	}
+	if s.requireDPoPNonce {
+		if claims.Nonce == "" || !s.consumeDPoPNonce(claims.Nonce) {
+			return "", errDPoPNonceRequired
+		}
+	}
 
 	return header.JWK.thumbprint()
 }
@@ -217,18 +232,67 @@ func (s *Server) dpopJTISeen(jti string) bool {
 	return false
 }
 
+// issueDPoPNonce mints a single-use nonce for a client to embed in its next
+// DPoP proof, per the RFC 9449 §8 challenge/response mechanism.
+func (s *Server) issueDPoPNonce() string {
+	nonce := secrets.RandomToken(24)
+	s.dpopMu.Lock()
+	if len(s.dpopNonces) > 5000 {
+		now := time.Now()
+		for k, exp := range s.dpopNonces {
+			if now.After(exp) {
+				delete(s.dpopNonces, k)
+			}
+		}
+	}
+	s.dpopNonces[nonce] = time.Now().Add(dpopProofMaxAge)
+	s.dpopMu.Unlock()
+	return nonce
+}
+
+// consumeDPoPNonce validates and invalidates a nonce in one step (single-use).
+func (s *Server) consumeDPoPNonce(nonce string) bool {
+	s.dpopMu.Lock()
+	defer s.dpopMu.Unlock()
+	expires, ok := s.dpopNonces[nonce]
+	if !ok {
+		return false
+	}
+	delete(s.dpopNonces, nonce)
+	return time.Now().Before(expires)
+}
+
 // dpopProofFromRequest validates the request's DPoP header, if present,
 // against its own method+URL and returns the resulting jkt (empty if the
-// client didn't send one — a normal Bearer-token request).
-func (s *Server) dpopProofFromRequest(r *http.Request) (jkt string, headerErr string) {
+// client didn't send one — a normal Bearer-token request). When the server
+// requires a nonce and none/an invalid one was presented, it writes the
+// RFC 9449 §8 challenge response itself (400 use_dpop_nonce + a fresh
+// DPoP-Nonce header) and the caller should stop processing the request.
+func (s *Server) dpopProofFromRequest(w http.ResponseWriter, r *http.Request) (jkt string, headerErr string, challenged bool) {
 	proof := r.Header.Get("DPoP")
 	if proof == "" {
-		return "", ""
+		return "", "", false
 	}
 	full := s.endpoint(r.URL.Path)
 	jkt, err := s.verifyDPoPProof(proof, r.Method, full)
 	if err != nil {
-		return "", err.Error()
+		if errors.Is(err, errDPoPNonceRequired) {
+			s.metrics.dpopRejections.WithLabelValues("nonce_required").Inc()
+			w.Header().Set("DPoP-Nonce", s.issueDPoPNonce())
+			writeOAuthError(w, http.StatusBadRequest, "use_dpop_nonce", "Retry with the nonce from the DPoP-Nonce response header")
+			return "", "", true
+		}
+		// A fixed label, not err.Error(): several of verifyDPoPProof's error
+		// messages interpolate attacker-controlled fields (e.g. the proof's
+		// own "alg"), and an unbounded label value on an unauthenticated
+		// endpoint is a cardinality/memory-exhaustion vector.
+		s.metrics.dpopRejections.WithLabelValues("invalid_proof").Inc()
+		return "", err.Error(), false
 	}
-	return jkt, ""
+	if s.requireDPoPNonce {
+		// Hand the client a nonce for its *next* request now, so a well-behaved
+		// client only ever pays the challenge round trip once per key.
+		w.Header().Set("DPoP-Nonce", s.issueDPoPNonce())
+	}
+	return jkt, "", false
 }

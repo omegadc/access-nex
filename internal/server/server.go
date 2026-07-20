@@ -7,15 +7,17 @@ package server
 import (
 	"crypto/rsa"
 	"crypto/subtle"
-	"log"
+	"log/slog"
 	"net/http"
 	"net/url"
+	"os"
 	"strings"
 	"sync"
 	"time"
 
 	"golang.org/x/crypto/bcrypt"
 
+	"github.com/omegadc/access-nex/internal/email"
 	"github.com/omegadc/access-nex/internal/models"
 	"github.com/omegadc/access-nex/internal/secrets"
 	"github.com/omegadc/access-nex/internal/store"
@@ -33,12 +35,34 @@ type SigningKey struct {
 	Key *rsa.PrivateKey
 }
 
+// Config is everything New needs to build a Server. Keys must be non-empty
+// with the active signing key first. Mailer, Logger, and the WebAuthn/DPoP
+// settings are optional — sensible defaults are used when left zero.
+type Config struct {
+	Issuer           string
+	Keys             []SigningKey
+	Store            *store.Store
+	Box              *secrets.Box
+	Mailer           email.Mailer
+	Logger           *slog.Logger
+	RequireDPoPNonce bool
+	WebAuthnRPName   string   // relying party display name shown by authenticators
+	FrontendOrigins  []string // extra CORS origins for a separately-hosted frontend using /api/v1
+}
+
 type Server struct {
 	issuer        string
 	keys          []SigningKey // keys[0] is the active signing key
 	store         *store.Store
 	box           *secrets.Box
+	mailer        email.Mailer
+	log           *slog.Logger
 	secureCookies bool
+
+	requireDPoPNonce bool
+	webauthn         *webauthnService
+	metrics          *metrics
+	frontendOrigins  []string
 
 	loginLimiter *rateLimiter
 	tokenLimiter *rateLimiter
@@ -47,8 +71,9 @@ type Server struct {
 	oauthStates map[string]*models.OAuthProxyState
 	totpPending map[string]*pendingTOTP
 
-	dpopMu   sync.Mutex
-	dpopSeen map[string]time.Time // DPoP proof jti → seen-at, replay cache
+	dpopMu     sync.Mutex
+	dpopSeen   map[string]time.Time // DPoP proof jti → seen-at, replay cache
+	dpopNonces map[string]time.Time // server-issued nonces awaiting use
 
 	corsMu      sync.Mutex
 	corsOrigins map[string]bool
@@ -62,21 +87,49 @@ type pendingTOTP struct {
 	ExpiresAt time.Time
 }
 
-// New builds a Server. keys must be non-empty with the active key first.
-func New(issuer string, keys []SigningKey, st *store.Store, box *secrets.Box) *Server {
-	return &Server{
-		issuer:        issuer,
-		keys:          keys,
-		store:         st,
-		box:           box,
-		secureCookies: strings.HasPrefix(issuer, "https://"),
-		loginLimiter:  newRateLimiter(10, time.Minute),
-		tokenLimiter:  newRateLimiter(60, time.Minute),
-		oauthStates:   make(map[string]*models.OAuthProxyState),
-		totpPending:   make(map[string]*pendingTOTP),
-		dpopSeen:      make(map[string]time.Time),
+// New builds a Server from cfg. A nil Mailer becomes a no-op mailer (send
+// calls succeed without delivering anything) so callers that genuinely don't
+// want email features enabled don't have to construct one just to pass here;
+// cli.go always passes a real Mailer (SMTP or the file-logging dev fallback).
+func New(cfg Config) *Server {
+	if cfg.Mailer == nil {
+		cfg.Mailer = noopMailer{}
 	}
+	logger := cfg.Logger
+	if logger == nil {
+		logger = slog.New(slog.NewTextHandler(os.Stderr, nil))
+	}
+	s := &Server{
+		issuer:           cfg.Issuer,
+		keys:             cfg.Keys,
+		store:            cfg.Store,
+		box:              cfg.Box,
+		mailer:           cfg.Mailer,
+		log:              logger,
+		secureCookies:    strings.HasPrefix(cfg.Issuer, "https://"),
+		requireDPoPNonce: cfg.RequireDPoPNonce,
+		frontendOrigins:  cfg.FrontendOrigins,
+		loginLimiter:     newRateLimiter(10, time.Minute),
+		tokenLimiter:     newRateLimiter(60, time.Minute),
+		oauthStates:      make(map[string]*models.OAuthProxyState),
+		totpPending:      make(map[string]*pendingTOTP),
+		dpopSeen:         make(map[string]time.Time),
+		dpopNonces:       make(map[string]time.Time),
+	}
+	rpName := cfg.WebAuthnRPName
+	if rpName == "" {
+		rpName = "Access-Nex"
+	}
+	s.webauthn = newWebAuthnService(s, rpName)
+	s.metrics = newMetrics()
+	return s
 }
+
+// noopMailer discards mail; used only as New's fallback when no Mailer is
+// configured at all.
+type noopMailer struct{}
+
+func (noopMailer) Send(to, subject, body string) error { return nil }
 
 func (s *Server) activeKey() SigningKey { return s.keys[0] }
 
@@ -109,6 +162,12 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("/portal", s.handlePortal)
 	mux.HandleFunc("/portal/logout", s.handlePortalLogout)
 
+	// Password reset + email verification
+	mux.HandleFunc("/forgot-password", s.handleForgotPassword)
+	mux.HandleFunc("/reset-password", s.handleResetPassword)
+	mux.HandleFunc("/verify-email", s.handleVerifyEmail)
+	mux.HandleFunc("POST /portal/verify-email/resend", s.handlePortalResendVerification)
+
 	// Portal self-service
 	mux.HandleFunc("GET /portal/2fa", s.handleTOTPPage)
 	mux.HandleFunc("POST /portal/2fa/enroll", s.handleTOTPEnroll)
@@ -118,6 +177,13 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("POST /portal/grants/revoke", s.handlePortalRevokeGrant)
 	mux.HandleFunc("POST /portal/sessions/revoke", s.handlePortalRevokeSession)
 	mux.HandleFunc("POST /portal/identities/unlink", s.handlePortalUnlinkIdentity)
+
+	// WebAuthn / passkeys: portal registration + login second factor
+	mux.HandleFunc("POST /portal/webauthn/register/begin", s.handleWebAuthnRegisterBegin)
+	mux.HandleFunc("POST /portal/webauthn/register/finish", s.handleWebAuthnRegisterFinish)
+	mux.HandleFunc("POST /portal/webauthn/delete", s.handlePortalWebAuthnDelete)
+	mux.HandleFunc("POST /login/webauthn/begin", s.handleWebAuthnLoginBegin)
+	mux.HandleFunc("POST /login/webauthn/finish", s.handleWebAuthnLoginFinish)
 
 	// RFC 8628 device authorization grant
 	mux.HandleFunc("POST /device_authorize", s.handleDeviceAuthorize)
@@ -135,7 +201,14 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("DELETE /api/admin/providers/{id}", s.requireAdminAPI(s.apiDeleteProvider))
 	mux.HandleFunc("GET /api/admin/audit", s.requireAdminAPI(s.apiListAudit))
 
-	return s.withSecurityHeaders(mux)
+	// JSON account API for a separately-hosted frontend (see apiv1.go).
+	s.registerAPIv1(mux)
+
+	// Prometheus metrics — unauthenticated by design (standard practice);
+	// keep this off the public internet at the network/reverse-proxy layer.
+	mux.Handle("GET /metrics", s.handleMetrics())
+
+	return s.withMetrics(mux, s.withSecurityHeaders(mux))
 }
 
 func (s *Server) endpoint(path string) string { return s.issuer + path }
@@ -152,6 +225,11 @@ func (s *Server) allowedOrigin(origin string) bool {
 		origins := map[string]bool{}
 		if u, err := url.Parse(s.issuer); err == nil && u.Scheme != "" {
 			origins[u.Scheme+"://"+u.Host] = true
+		}
+		// Explicitly configured origins for a separately-hosted frontend
+		// (e.g. a Python SPA/BFF) driving the /api/v1 surface cross-origin.
+		for _, o := range s.frontendOrigins {
+			origins[o] = true
 		}
 		apps, err := s.store.ListApps()
 		if err == nil {
@@ -252,7 +330,7 @@ func (s *Server) startSession(w http.ResponseWriter, subject string) {
 	sessionID := secrets.RandomToken(32)
 	expires := time.Now().Add(8 * time.Hour)
 	if err := s.store.SaveSession(&models.Session{ID: sessionID, Subject: subject, ExpiresAt: expires}); err != nil {
-		log.Printf("save session: %v", err)
+		s.log.Error("save session", "error", err)
 		return
 	}
 	http.SetCookie(w, &http.Cookie{
@@ -269,7 +347,7 @@ func (s *Server) startSession(w http.ResponseWriter, subject string) {
 func (s *Server) endSession(w http.ResponseWriter, r *http.Request) {
 	if cookie, err := r.Cookie(sessionCookie); err == nil {
 		if err := s.store.DeleteSession(cookie.Value); err != nil {
-			log.Printf("delete session: %v", err)
+			s.log.Error("delete session", "error", err)
 		}
 	}
 	http.SetCookie(w, &http.Cookie{
@@ -303,10 +381,12 @@ func (s *Server) verifyPassword(username, password, ip string) (*models.User, bo
 	u, err := s.store.GetUserByUsername(username)
 	if err != nil || u.PasswordHash == "" {
 		s.store.Audit("login_failed", "", "", ip, "unknown user or passwordless account: "+username)
+		s.metrics.loginResults.WithLabelValues("failed").Inc()
 		return nil, false
 	}
 	if !u.LockedUntil.IsZero() && time.Now().Before(u.LockedUntil) {
 		s.store.Audit("login_locked", u.Subject, "", ip, "account locked until "+u.LockedUntil.Format(time.RFC3339))
+		s.metrics.loginResults.WithLabelValues("locked").Inc()
 		return nil, false
 	}
 	if bcrypt.CompareHashAndPassword([]byte(u.PasswordHash), []byte(password)) != nil {
@@ -316,9 +396,13 @@ func (s *Server) verifyPassword(username, password, ip string) (*models.User, bo
 			detail = "wrong password; account locked"
 		}
 		s.store.Audit("login_failed", u.Subject, "", ip, detail)
+		s.metrics.loginResults.WithLabelValues("failed").Inc()
 		return nil, false
 	}
 	_ = s.store.ClearLoginFailures(username)
+	// Not counted as a metrics "success" here: password-correct doesn't mean
+	// fully logged in when 2FA is enrolled. The login_success audit call
+	// sites (after any 2FA step completes) record that outcome instead.
 	return u, true
 }
 
@@ -345,4 +429,26 @@ func (s *Server) consumeTOTPPending(token string) (string, bool) {
 		return "", false
 	}
 	return p.Subject, true
+}
+
+// peekPendingSubject resolves a pending-login token without consuming it —
+// used by the WebAuthn login "begin" step, which needs to know who's
+// authenticating without invalidating the token (the "finish" step, or a
+// TOTP code, consumes it later).
+func (s *Server) peekPendingSubject(token string) (string, bool) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	p := s.totpPending[token]
+	if p == nil || time.Now().After(p.ExpiresAt) {
+		return "", false
+	}
+	return p.Subject, true
+}
+
+// deletePendingSecondFactor explicitly invalidates a pending-login token
+// (used once a second factor — WebAuthn — has actually succeeded).
+func (s *Server) deletePendingSecondFactor(token string) {
+	s.mu.Lock()
+	delete(s.totpPending, token)
+	s.mu.Unlock()
 }

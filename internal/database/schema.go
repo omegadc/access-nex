@@ -175,6 +175,37 @@ CREATE TABLE IF NOT EXISTS group_members (
     user_id  INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
     PRIMARY KEY (group_id, user_id)
 );
+
+-- Single-use, expiring tokens for the forgot-password flow.
+CREATE TABLE IF NOT EXISTS password_resets (
+    token      TEXT PRIMARY KEY,
+    subject    TEXT NOT NULL,
+    expires_at TEXT NOT NULL,
+    created_at TEXT NOT NULL
+);
+
+-- Single-use, expiring tokens for confirming an email address.
+CREATE TABLE IF NOT EXISTS email_verifications (
+    token      TEXT PRIMARY KEY,
+    subject    TEXT NOT NULL,
+    expires_at TEXT NOT NULL,
+    created_at TEXT NOT NULL
+);
+
+-- WebAuthn/passkey credentials (FIDO2 / WebAuthn Level 2). One user may
+-- register several (phone, security key, laptop TPM, ...). credential_json
+-- is the go-webauthn library's own Credential struct, serialized whole —
+-- storing it verbatim (rather than picking individual fields into columns)
+-- means library upgrades that add fields to that struct don't require a
+-- schema migration here.
+CREATE TABLE IF NOT EXISTS webauthn_credentials (
+    id              TEXT PRIMARY KEY, -- base64url credential ID
+    user_id         INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+    name            TEXT NOT NULL DEFAULT '',
+    credential_json TEXT NOT NULL,
+    created_at      TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_webauthn_user ON webauthn_credentials(user_id);
 `, autoIncPK(d))
 }
 
@@ -195,4 +226,5 @@ var columnMigrations = []struct{ table, column, ddl string }{
 	{"applications", "frontchannel_logout_uri", `ALTER TABLE applications ADD COLUMN frontchannel_logout_uri TEXT NOT NULL DEFAULT ''`},
 	{"sessions", "created_at", `ALTER TABLE sessions ADD COLUMN created_at TEXT NOT NULL DEFAULT ''`},
 	{"sessions", "user_agent", `ALTER TABLE sessions ADD COLUMN user_agent TEXT NOT NULL DEFAULT ''`},
+	{"users", "email_verified", `ALTER TABLE users ADD COLUMN email_verified INTEGER NOT NULL DEFAULT 0`},
 }

@@ -1,0 +1,64 @@
+# Access-Nex + PostgreSQL. `docker compose up -d`, then run the CLI commands
+# below (once) to create your first admin user and application.
+#
+# On the same Docker network, Portainer (or any other container) reaches
+# this service at http://access-nex:8080 — no host.docker.internal needed,
+# since both containers share the compose network.
+#
+# First-time setup:
+#   docker compose up -d
+#   docker compose exec access-nex access-nex --db "$ACCESS_NEX_DB" user add -u admin -p CHANGE_ME --admin --verified
+#   docker compose exec access-nex access-nex --db "$ACCESS_NEX_DB" app create -n "My App" -r https://your-app/callback
+#
+# access-nex auto-initializes the local OIDC provider on first `server`
+# start (using --issuer below), so no separate init step is needed for that.
+#
+# Why PostgreSQL (not the default SQLite) for the Docker deployment: with
+# SQLite, `docker exec ... access-nex ...` admin commands run against the
+# *same file* the long-running server process has open, and some Docker
+# volume backends don't reliably surface one process's writes to another
+# process's already-open connection on that file — writes and reads can
+# silently miss each other. PostgreSQL is a real client-server database, so
+# `docker compose exec` always sees consistent, current data. If you do run
+# access-nex with SQLite in a container, manage users/apps through the
+# /admin web UI instead of `docker exec` while the server is running.
+
+services:
+  db:
+    image: postgres:16-alpine
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: accessnex
+      POSTGRES_USER: accessnex
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?set POSTGRES_PASSWORD in a .env file}
+    volumes:
+      - accessnex-db:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U accessnex"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+  access-nex:
+    build: .
+    restart: unless-stopped
+    depends_on:
+      db:
+        condition: service_healthy
+    ports:
+      - "8080:8080"
+    volumes:
+      # AES box key + signing key persist here regardless of --db.
+      - accessnex-config:/data
+    environment:
+      ACCESS_NEX_DB: postgres://accessnex:${POSTGRES_PASSWORD:?}@db:5432/accessnex?sslmode=disable
+    command:
+      - server
+      - --config=/data
+      - --db=postgres://accessnex:${POSTGRES_PASSWORD:?}@db:5432/accessnex?sslmode=disable
+      - --addr=:8080
+      - --issuer=http://localhost:8080
+
+volumes:
+  accessnex-db:
+  accessnex-config:

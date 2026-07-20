@@ -10,7 +10,6 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
-	"log"
 	"net/http"
 	"net/url"
 	"strings"
@@ -167,20 +166,20 @@ func (s *Server) handleOAuthCallback(w http.ResponseWriter, r *http.Request) {
 	}
 	clientSecret, err := s.box.Decrypt(ep.ClientSecretEnc)
 	if err != nil {
-		log.Printf("oauth callback: decrypt secret: %v", err)
+		s.log.Error("oauth callback: decrypt secret", "error", err)
 		http.Error(w, "server configuration error", http.StatusInternalServerError)
 		return
 	}
 
 	extTokens, err := exchangeCodeWithProvider(ep.AccessTokenURL, ep.ClientID, clientSecret, code, s.providerCallbackURL(ep))
 	if err != nil {
-		log.Printf("oauth callback: token exchange: %v", err)
+		s.log.Error("oauth callback: token exchange", "error", err)
 		http.Error(w, "token exchange failed", http.StatusBadGateway)
 		return
 	}
 	accessToken, _ := extTokens["access_token"].(string)
 	if accessToken == "" {
-		log.Printf("oauth callback: no access_token in response from %s", ep.AccessTokenURL)
+		s.log.Error("oauth callback: no access_token in provider response", "access_token_url", ep.AccessTokenURL)
 		http.Error(w, "no access_token in provider response", http.StatusBadGateway)
 		return
 	}
@@ -189,7 +188,7 @@ func (s *Server) handleOAuthCallback(w http.ResponseWriter, r *http.Request) {
 	if ep.ResourceURL != "" {
 		userInfo, err = fetchUserInfo(ep.ResourceURL, accessToken)
 		if err != nil {
-			log.Printf("oauth callback: userinfo: %v", err)
+			s.log.Error("oauth callback: userinfo", "error", err)
 			http.Error(w, "failed to fetch user info", http.StatusBadGateway)
 			return
 		}
@@ -197,7 +196,7 @@ func (s *Server) handleOAuthCallback(w http.ResponseWriter, r *http.Request) {
 
 	subject, err := s.provisionExternalUser(ep, userInfo)
 	if err != nil {
-		log.Printf("oauth callback: provision user: %v", err)
+		s.log.Error("oauth callback: provision user", "error", err)
 		http.Error(w, "failed to provision user", http.StatusInternalServerError)
 		return
 	}
@@ -214,7 +213,7 @@ func (s *Server) handleOAuthCallback(w http.ResponseWriter, r *http.Request) {
 		AuthTime:    time.Now(),
 	})
 	if err != nil {
-		log.Printf("oauth callback: save code: %v", err)
+		s.log.Error("oauth callback: save code", "error", err)
 		http.Error(w, "failed to issue code", http.StatusInternalServerError)
 		return
 	}

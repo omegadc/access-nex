@@ -12,14 +12,14 @@ import (
 
 var ErrNotFound = errors.New("not found")
 
-const userCols = `id, subject, username, password_hash, email, name, provider_id, external_id,
+const userCols = `id, subject, username, password_hash, email, email_verified, name, provider_id, external_id,
 	is_admin, failed_logins, locked_until, totp_secret, totp_enabled, created_at, updated_at`
 
 func scanUser(row interface{ Scan(...any) error }) (*models.User, error) {
 	var u models.User
 	var providerID sql.NullString
 	var locked, created, updated string
-	err := row.Scan(&u.ID, &u.Subject, &u.Username, &u.PasswordHash, &u.Email,
+	err := row.Scan(&u.ID, &u.Subject, &u.Username, &u.PasswordHash, &u.Email, &u.EmailVerified,
 		&u.Name, &providerID, &u.ExternalID,
 		&u.IsAdmin, &u.FailedLogins, &locked, &u.TOTPSecret, &u.TOTPEnabled, &created, &updated)
 	if err != nil {
@@ -40,10 +40,10 @@ func scanUser(row interface{ Scan(...any) error }) (*models.User, error) {
 func (s *Store) CreateUser(u *models.User) error {
 	ts := now()
 	res, err := s.db.Exec(`
-		INSERT INTO users (subject, username, password_hash, email, name, provider_id, external_id,
+		INSERT INTO users (subject, username, password_hash, email, email_verified, name, provider_id, external_id,
 			is_admin, created_at, updated_at)
-		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-		u.Subject, u.Username, u.PasswordHash, u.Email, u.Name,
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+		u.Subject, u.Username, u.PasswordHash, u.Email, u.EmailVerified, u.Name,
 		nullable(u.ProviderID), u.ExternalID, u.IsAdmin, ts, ts)
 	if err != nil {
 		if strings.Contains(err.Error(), "UNIQUE") {
@@ -52,6 +52,19 @@ func (s *Store) CreateUser(u *models.User) error {
 		return err
 	}
 	u.ID, _ = res.LastInsertId()
+	return nil
+}
+
+// SetEmailVerified marks (or clears) a user's email as verified.
+func (s *Store) SetEmailVerified(subject string, verified bool) error {
+	res, err := s.db.Exec(`UPDATE users SET email_verified = ?, updated_at = ? WHERE subject = ?`,
+		verified, now(), subject)
+	if err != nil {
+		return err
+	}
+	if n, _ := res.RowsAffected(); n == 0 {
+		return ErrNotFound
+	}
 	return nil
 }
 
@@ -214,12 +227,13 @@ func (s *Store) EnsureExternalUser(providerID, externalID, login, email, name st
 	}
 
 	u := &models.User{
-		Subject:    fmt.Sprintf("ext:%s:%s", providerID, externalID),
-		Username:   username,
-		Email:      email,
-		Name:       name,
-		ProviderID: providerID,
-		ExternalID: externalID,
+		Subject:       fmt.Sprintf("ext:%s:%s", providerID, externalID),
+		Username:      username,
+		Email:         email,
+		EmailVerified: emailVerified, // trust the provider's own claim
+		Name:          name,
+		ProviderID:    providerID,
+		ExternalID:    externalID,
 	}
 	if err := s.CreateUser(u); err != nil {
 		return "", false, false, err

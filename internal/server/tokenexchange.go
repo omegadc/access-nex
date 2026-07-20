@@ -81,6 +81,7 @@ func (s *Server) handleTokenExchangeGrant(w http.ResponseWriter, r *http.Request
 	}
 	s.store.Audit("token_exchanged", original.Subject, client.ID, clientIP(r),
 		client.ID+" now acting for subject_token originally issued to "+original.ClientID)
+	s.metrics.tokensIssued.WithLabelValues(tokenExchangeGrantType).Inc()
 
 	writeJSON(w, http.StatusOK, map[string]any{
 		"access_token":      record.Token,

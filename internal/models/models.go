@@ -15,21 +15,22 @@ const (
 // ProviderID; accounts provisioned from an external provider have ProviderID
 // and ExternalID set and an empty PasswordHash (they cannot password-login).
 type User struct {
-	ID           int64
-	Subject      string // OIDC "sub" claim, unique
-	Username     string
-	PasswordHash string
-	Email        string
-	Name         string
-	ProviderID   string // "" = local account
-	ExternalID   string // user's ID at the external provider
-	IsAdmin      bool
-	FailedLogins int
-	LockedUntil  time.Time // zero = not locked
-	TOTPSecret   string    // base32, empty until enrolled
-	TOTPEnabled  bool
-	CreatedAt    time.Time
-	UpdatedAt    time.Time
+	ID            int64
+	Subject       string // OIDC "sub" claim, unique
+	Username      string
+	PasswordHash  string
+	Email         string
+	EmailVerified bool
+	Name          string
+	ProviderID    string // "" = local account
+	ExternalID    string // user's ID at the external provider
+	IsAdmin       bool
+	FailedLogins  int
+	LockedUntil   time.Time // zero = not locked
+	TOTPSecret    string    // base32, empty until enrolled
+	TOTPEnabled   bool
+	CreatedAt     time.Time
+	UpdatedAt     time.Time
 }
 
 // App is a row in the applications table: an OAuth2/OIDC client registration.
@@ -154,6 +155,17 @@ type Identity struct {
 	ProviderID string
 	ExternalID string
 	CreatedAt  time.Time
+}
+
+// WebAuthnCredential is a registered passkey/security key. CredentialJSON is
+// the go-webauthn library's Credential struct, stored serialized whole (see
+// internal/database/schema.go for why).
+type WebAuthnCredential struct {
+	ID             string // base64url credential ID
+	UserID         int64
+	Name           string // user-facing label, e.g. "YubiKey"
+	CredentialJSON []byte
+	CreatedAt      time.Time
 }
 
 // Group is a role/team users can belong to; membership is exposed to clients

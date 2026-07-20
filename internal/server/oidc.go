@@ -162,12 +162,14 @@ func (s *Server) handleAuthorize(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		user := s.userBySubject(pendingSubject)
-		if user == nil || !secrets.VerifyTOTP(user.TOTPSecret, r.Form.Get("totp_code")) {
+		if user == nil || !user.TOTPEnabled || !secrets.VerifyTOTP(user.TOTPSecret, r.Form.Get("totp_code")) {
 			s.store.Audit("login_2fa_failed", pendingSubject, client.ID, clientIP(r), "")
-			s.renderTOTPChallenge(w, req, client.Name, s.newTOTPPending(pendingSubject), "Invalid code — try again")
+			s.metrics.loginResults.WithLabelValues("2fa_failed").Inc()
+			s.renderTOTPChallenge(w, req, client.Name, pendingSubject, s.newTOTPPending(pendingSubject), "Invalid code — try again")
 			return
 		}
 		s.store.Audit("login_success", pendingSubject, client.ID, clientIP(r), "with 2FA")
+		s.metrics.loginResults.WithLabelValues("success").Inc()
 		s.startSession(w, pendingSubject)
 		s.continueAuthorizeAfterLogin(w, r, req, client, pendingSubject, forceConsent, promptNone)
 		return
@@ -216,11 +218,12 @@ func (s *Server) handleAuthorize(w http.ResponseWriter, r *http.Request) {
 				s.renderLogin(w, req, client.Name, "Invalid username or password")
 				return
 			}
-			if user.TOTPEnabled {
-				s.renderTOTPChallenge(w, req, client.Name, s.newTOTPPending(user.Subject), "")
+			if user.TOTPEnabled || s.hasWebAuthnCredentials(user.Subject) {
+				s.renderTOTPChallenge(w, req, client.Name, user.Subject, s.newTOTPPending(user.Subject), "")
 				return
 			}
 			s.store.Audit("login_success", user.Subject, client.ID, clientIP(r), "")
+			s.metrics.loginResults.WithLabelValues("success").Inc()
 			s.startSession(w, user.Subject)
 			subject = user.Subject
 			// prompt=login is satisfied by the fresh authentication.
@@ -339,7 +342,11 @@ func (s *Server) handleToken(w http.ResponseWriter, r *http.Request) {
 	var jkt string
 	if r.Header.Get("DPoP") != "" {
 		var proofErr string
-		jkt, proofErr = s.dpopProofFromRequest(r)
+		var challenged bool
+		jkt, proofErr, challenged = s.dpopProofFromRequest(w, r)
+		if challenged {
+			return // dpopProofFromRequest already wrote the use_dpop_nonce challenge
+		}
 		if proofErr != "" {
 			writeOAuthError(w, http.StatusBadRequest, "invalid_dpop_proof", proofErr)
 			return
@@ -412,6 +419,7 @@ func (s *Server) handleAuthorizationCodeGrant(w http.ResponseWriter, r *http.Req
 		return
 	}
 	s.store.Audit("token_issued", code.Subject, client.ID, clientIP(r), "authorization_code")
+	s.metrics.tokensIssued.WithLabelValues("authorization_code").Inc()
 	writeJSON(w, http.StatusOK, response)
 }
 
@@ -438,6 +446,7 @@ func (s *Server) handleRefreshTokenGrant(w http.ResponseWriter, r *http.Request,
 		return
 	}
 	s.store.Audit("token_refreshed", refresh.Subject, client.ID, clientIP(r), "")
+	s.metrics.tokensIssued.WithLabelValues("refresh_token").Inc()
 	writeJSON(w, http.StatusOK, response)
 }
 
@@ -461,6 +470,7 @@ func (s *Server) handleClientCredentialsGrant(w http.ResponseWriter, r *http.Req
 		return
 	}
 	s.store.Audit("token_issued", client.ID, client.ID, clientIP(r), "client_credentials")
+	s.metrics.tokensIssued.WithLabelValues("client_credentials").Inc()
 	writeJSON(w, http.StatusOK, map[string]any{
 		"access_token": record.Token,
 		"token_type":   tokenType(jkt),
@@ -583,7 +593,7 @@ func (s *Server) issueIDToken(clientID, subject string, scope []string, nonce st
 			}
 			if hasScope(scope, "email") {
 				claims["email"] = user.Email
-				claims["email_verified"] = true
+				claims["email_verified"] = user.EmailVerified
 			}
 		}
 	}
@@ -704,7 +714,10 @@ func (s *Server) handleUserInfo(w http.ResponseWriter, r *http.Request) {
 			writeOAuthError(w, http.StatusUnauthorized, "invalid_token", "This token requires the DPoP scheme")
 			return
 		}
-		jkt, proofErr := s.dpopProofFromRequest(r)
+		jkt, proofErr, challenged := s.dpopProofFromRequest(w, r)
+		if challenged {
+			return // dpopProofFromRequest already wrote the use_dpop_nonce challenge
+		}
 		if proofErr != "" || jkt != record.JKT {
 			w.Header().Set("WWW-Authenticate", `DPoP realm="userinfo", error="invalid_token"`)
 			writeOAuthError(w, http.StatusUnauthorized, "invalid_token", "Missing or mismatched DPoP proof")
@@ -732,7 +745,7 @@ func (s *Server) handleUserInfo(w http.ResponseWriter, r *http.Request) {
 	}
 	if hasScope(record.Scope, "email") {
 		claims["email"] = user.Email
-		claims["email_verified"] = true
+		claims["email_verified"] = user.EmailVerified
 	}
 	if hasScope(record.Scope, "groups") {
 		if names, err := s.store.GroupNamesForSubject(user.Subject); err == nil {

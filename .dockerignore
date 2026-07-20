@@ -1,0 +1,11 @@
+.git
+.access-nex
+*.exe
+*.db
+*.db.bak-*
+cmd/_devtools
+README.md
+OAUTH_FLOW_DIAGRAM.md
+docker-compose*.yml
+Dockerfile
+.dockerignore

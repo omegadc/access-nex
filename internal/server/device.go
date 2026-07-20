@@ -246,5 +246,6 @@ func (s *Server) handleDeviceCodeGrant(w http.ResponseWriter, r *http.Request, c
 	}
 	_ = s.store.DeleteDeviceCode(deviceCode)
 	s.store.Audit("token_issued", d.Subject, client.ID, clientIP(r), "device_code")
+	s.metrics.tokensIssued.WithLabelValues(deviceGrantType).Inc()
 	writeJSON(w, http.StatusOK, response)
 }

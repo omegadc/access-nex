@@ -6,7 +6,6 @@ package server
 import (
 	"fmt"
 	"html/template"
-	"log"
 	"net/http"
 	"strings"
 
@@ -65,7 +64,7 @@ func (s *Server) handleHome(w http.ResponseWriter, r *http.Request) {
 	}
 	users, apps, ext, err := s.store.Counts()
 	if err != nil {
-		log.Printf("home: counts: %v", err)
+		s.log.Error("home: counts", "error", err)
 	}
 
 	headerRight := `<div style="margin-top:16px"><a href="/login" class="btn" style="background:#fff;color:#667eea">Sign In</a></div>`
@@ -143,12 +142,13 @@ func (s *Server) handleLogin(w http.ResponseWriter, r *http.Request) {
 			s.renderDirectLoginPage(w, "Invalid username or password", returnTo)
 			return
 		}
-		if user.TOTPEnabled {
+		if user.TOTPEnabled || s.hasWebAuthnCredentials(user.Subject) {
 			token := s.newTOTPPending(user.Subject)
-			s.renderDirectTOTPPage(w, token, returnTo, "")
+			s.renderDirectTOTPPage(w, user.Subject, token, returnTo, "")
 			return
 		}
 		s.store.Audit("login_success", user.Subject, "", clientIP(r), "")
+		s.metrics.loginResults.WithLabelValues("success").Inc()
 		s.startSession(w, user.Subject)
 		http.Redirect(w, r, returnTo, http.StatusFound)
 		return
@@ -178,26 +178,32 @@ func (s *Server) handleLoginTOTP(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	user := s.userBySubject(subject)
-	if user == nil || !secrets.VerifyTOTP(user.TOTPSecret, r.Form.Get("totp_code")) {
+	if user == nil || !user.TOTPEnabled || !secrets.VerifyTOTP(user.TOTPSecret, r.Form.Get("totp_code")) {
 		s.store.Audit("login_2fa_failed", subject, "", clientIP(r), "")
-		s.renderDirectTOTPPage(w, s.newTOTPPending(subject), returnTo, "Invalid code — try again")
+		s.metrics.loginResults.WithLabelValues("2fa_failed").Inc()
+		s.renderDirectTOTPPage(w, subject, s.newTOTPPending(subject), returnTo, "Invalid code — try again")
 		return
 	}
 	s.store.Audit("login_success", subject, "", clientIP(r), "with 2FA")
+	s.metrics.loginResults.WithLabelValues("success").Inc()
 	s.startSession(w, subject)
 	http.Redirect(w, r, returnTo, http.StatusFound)
 }
 
-func (s *Server) renderDirectTOTPPage(w http.ResponseWriter, token, returnTo, errMsg string) {
+// renderDirectTOTPPage shows whichever second-factor methods subject
+// actually has: a TOTP code form, a "use security key" button, or both.
+func (s *Server) renderDirectTOTPPage(w http.ResponseWriter, subject, token, returnTo, errMsg string) {
 	errHTML := ""
 	if errMsg != "" {
 		errHTML = `<div class="error">` + esc(errMsg) + `</div>`
 	}
-	page := `<!doctype html><html lang="en"><head><meta charset="utf-8">
-<meta name="viewport" content="width=device-width,initial-scale=1"><title>Two-Factor — Access-Nex</title>` + loginStyle + `</head><body>
-<div class="card">
-  <div class="logo">🔐 Access-Nex</div><div class="sub">Two-Factor Authentication</div>` + errHTML + `
-  <h1>Enter your code</h1>
+	user := s.userBySubject(subject)
+	hasTOTP := user != nil && user.TOTPEnabled
+	hasWebAuthn := s.hasWebAuthnCredentials(subject)
+
+	totpFormHTML := ""
+	if hasTOTP {
+		totpFormHTML = `
   <p class="hint">Open your authenticator app and enter the current 6-digit code.</p>
   <form method="POST" action="/login/2fa">
     <input type="hidden" name="totp_token" value="` + esc(token) + `">
@@ -205,7 +211,25 @@ func (s *Server) renderDirectTOTPPage(w http.ResponseWriter, token, returnTo, er
     <label for="c">Code</label>
     <input type="text" id="c" name="totp_code" inputmode="numeric" pattern="[0-9]*" maxlength="6" autocomplete="one-time-code" required autofocus>
     <button type="submit">Verify</button>
-  </form>
+  </form>`
+	}
+	webauthnHTML := ""
+	if hasWebAuthn {
+		if !hasTOTP {
+			// WebAuthn-only: the hidden form still needs to carry totp_token
+			// for the JS to read (webauthnLoginScript looks it up by name),
+			// even though this form is never submitted directly.
+			webauthnHTML = `<form onsubmit="return false"><input type="hidden" name="totp_token" value="` + esc(token) + `"></form>`
+		}
+		onSuccess := `window.location.href = ` + jsonString(returnTo) + `;`
+		webauthnHTML += webauthnSecurityKeyButton() + webauthnJSHelpers() + webauthnLoginScript("form", onSuccess)
+	}
+
+	page := `<!doctype html><html lang="en"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1"><title>Two-Factor — Access-Nex</title>` + loginStyle + `</head><body>
+<div class="card">
+  <div class="logo">🔐 Access-Nex</div><div class="sub">Two-Factor Authentication</div>` + errHTML + `
+  <h1>Verify it's you</h1>` + totpFormHTML + webauthnHTML + `
   <div class="footer"><a href="/login">← Back to sign in</a></div>
 </div></body></html>`
 	w.Header().Set("Content-Type", "text/html; charset=utf-8")
@@ -231,7 +255,7 @@ func (s *Server) renderDirectLoginPage(w http.ResponseWriter, errMsg, returnTo s
     <input type="password" id="p" name="password" autocomplete="current-password" required>
     <button type="submit">Sign In</button>
   </form>
-  <div class="footer"><a href="/">← Back to home</a></div>
+  <div class="footer"><a href="/forgot-password">Forgot password?</a> · <a href="/">← Back to home</a></div>
 </div></body></html>`
 	w.Header().Set("Content-Type", "text/html; charset=utf-8")
 	w.Write([]byte(page))
@@ -253,7 +277,7 @@ func (s *Server) handlePortal(w http.ResponseWriter, r *http.Request) {
 
 	activeSessions, activeTokens, err := s.store.CountActive()
 	if err != nil {
-		log.Printf("portal: count active: %v", err)
+		s.log.Error("portal: count active", "error", err)
 	}
 
 	apps, _ := s.store.ListApps()
@@ -330,6 +354,15 @@ func (s *Server) handlePortal(w http.ResponseWriter, r *http.Request) {
 	if user.TOTPEnabled {
 		twoFAStatus = `<span class="badge">✓ Enabled</span> <a href="/portal/2fa" class="btn" style="margin-left:8px">Manage</a>`
 	}
+	emailVerifiedBadge := ""
+	verifyBanner := ""
+	if user.Email != "" && !user.EmailVerified {
+		emailVerifiedBadge = ` <span style="font-size:11px;background:#fef3c7;color:#92400e;padding:2px 8px;border-radius:10px;font-weight:600">unverified</span>`
+		verifyBanner = `<div class="section" style="background:#fffbeb;border-left:4px solid #f59e0b">
+      <p style="margin:0">📧 Your email address isn't verified yet.
+      <form method="POST" action="/portal/verify-email/resend" style="display:inline"><button type="submit" class="btn" style="padding:6px 14px;font-size:13px;margin-left:8px">Resend verification email</button></form></p>
+    </div>`
+	}
 
 	page := `<!doctype html><html lang="en"><head><meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1"><title>Portal — Access-Nex</title>` + pageStyle + `</head><body>
@@ -337,12 +370,12 @@ func (s *Server) handlePortal(w http.ResponseWriter, r *http.Request) {
   <div style="margin-top:12px"><a href="/" class="btn" style="background:rgba(255,255,255,.2)">Home</a>
   <a href="/portal/logout" class="btn" style="background:rgba(255,255,255,.2)">Sign Out</a></div></div>
 <div class="container">
-
+` + verifyBanner + `
   <div class="section"><h2>Signed-In User <span class="badge">✓ Validated</span></h2>
     <div class="grid">
       <div class="card"><strong>Display Name</strong><span style="font-size:15px">` + esc(user.Name) + `</span></div>
       <div class="card"><strong>Username</strong><span style="font-size:15px">` + esc(user.Username) + `</span></div>
-      <div class="card"><strong>Email</strong><span style="font-size:15px">` + esc(user.Email) + `</span></div>
+      <div class="card"><strong>Email</strong><span style="font-size:15px">` + esc(user.Email) + emailVerifiedBadge + `</span></div>
       <div class="card"><strong>Subject</strong><span style="font-size:12px"><code>` + esc(user.Subject) + `</code></span></div>
     </div></div>
 
@@ -511,7 +544,7 @@ func (s *Server) renderLogin(w http.ResponseWriter, req authRequest, clientName,
 	}{Error: message, ClientName: clientName, Fields: req.fields()}
 	w.Header().Set("Content-Type", "text/html; charset=utf-8")
 	if err := authorizeLoginTemplate.Execute(w, data); err != nil {
-		log.Printf("render login: %v", err)
+		s.log.Error("render login", "error", err)
 	}
 }
 

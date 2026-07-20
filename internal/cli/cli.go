@@ -15,6 +15,7 @@ import (
 	"golang.org/x/crypto/bcrypt"
 
 	"github.com/omegadc/access-nex/internal/database"
+	"github.com/omegadc/access-nex/internal/email"
 	"github.com/omegadc/access-nex/internal/models"
 	"github.com/omegadc/access-nex/internal/secrets"
 	"github.com/omegadc/access-nex/internal/server"
@@ -32,6 +33,13 @@ var (
 	dbDSN     string
 	db        *database.DB
 	st        *store.Store
+	mailer    email.Mailer
+
+	smtpHost string
+	smtpPort int
+	smtpUser string
+	smtpPass string
+	smtpFrom string
 )
 
 // Execute runs the root command; it is the only entry point used by main.
@@ -65,6 +73,9 @@ var rootCmd = &cobra.Command{
 			return err
 		}
 		st = store.New(db)
+		mailer = email.New(email.Config{
+			Host: smtpHost, Port: smtpPort, Username: smtpUser, Password: smtpPass, From: smtpFrom,
+		}, configDir)
 		return nil
 	},
 }
@@ -74,6 +85,12 @@ func init() {
 		"config directory (holds the SQLite database, AES key, and legacy signing key files)")
 	rootCmd.PersistentFlags().StringVar(&dbDSN, "db", "",
 		"database DSN; postgres://user:pass@host/db to use PostgreSQL, otherwise SQLite in --config is used")
+	rootCmd.PersistentFlags().StringVar(&smtpHost, "smtp-host", "",
+		"SMTP server for password-reset/verification emails; omit to write them to --config/outbox.log instead")
+	rootCmd.PersistentFlags().IntVar(&smtpPort, "smtp-port", 587, "SMTP server port")
+	rootCmd.PersistentFlags().StringVar(&smtpUser, "smtp-username", "", "SMTP username")
+	rootCmd.PersistentFlags().StringVar(&smtpPass, "smtp-password", "", "SMTP password")
+	rootCmd.PersistentFlags().StringVar(&smtpFrom, "smtp-from", "access-nex@localhost", "From address for outgoing mail")
 
 	rootCmd.AddCommand(userCmd, appCmd, providerCmd, serverCmd, shutdownCmd, migrateCmd, auditCmd)
 
@@ -84,6 +101,7 @@ func init() {
 	userAddCmd.Flags().StringP("email", "e", "", "Email")
 	userAddCmd.Flags().StringP("name", "n", "", "Full name")
 	userAddCmd.Flags().Bool("admin", false, "Grant admin rights (access to /admin)")
+	userAddCmd.Flags().Bool("verified", false, "Mark the email address as already verified")
 	userDeleteCmd.Flags().StringP("username", "u", "", "Username to delete")
 	userPromoteCmd.Flags().StringP("username", "u", "", "Username to promote")
 	userDemoteCmd.Flags().StringP("username", "u", "", "Username to demote")
@@ -140,9 +158,14 @@ func init() {
 		providerShowCmd, providerUpdateCmd, providerDeleteCmd)
 
 	serverCmd.Flags().StringP("addr", "a", defaultAddr, "Listen address")
+	serverCmd.Flags().String("issuer", "", "Issuer URL, used only if the provider hasn't been initialized yet (default "+defaultIssuer+")")
 	serverCmd.Flags().String("tls-cert", "", "Path to a TLS certificate (PEM); requires --tls-key")
 	serverCmd.Flags().String("tls-key", "", "Path to the TLS certificate's private key (PEM); requires --tls-cert")
 	serverCmd.Flags().Bool("tls-self-signed", false, "Serve HTTPS with an in-memory self-signed certificate (dev/local use)")
+	serverCmd.Flags().Bool("dpop-require-nonce", false, "Require a server-issued nonce in DPoP proofs (RFC 9449 §8)")
+	serverCmd.Flags().StringSlice("frontend-origin", nil, "Extra CORS origin(s) for a separately-hosted frontend using /api/v1 (repeatable)")
+	serverCmd.Flags().String("log-format", "text", "Log output format: text|json")
+	serverCmd.Flags().String("log-level", "info", "Log level: debug|info|warn|error")
 
 	// group
 	groupCmd.AddCommand(groupCreateCmd, groupListCmd, groupDeleteCmd, groupAddMemberCmd, groupRemoveMemberCmd)
@@ -175,17 +198,19 @@ var userAddCmd = &cobra.Command{
 			return fmt.Errorf("password is required")
 		}
 		admin, _ := cmd.Flags().GetBool("admin")
+		verified, _ := cmd.Flags().GetBool("verified")
 		hash, err := bcrypt.GenerateFromPassword([]byte(password), bcrypt.DefaultCost)
 		if err != nil {
 			return err
 		}
 		u := &models.User{
-			Subject:      fmt.Sprintf("user-%s-%d", username, time.Now().UnixNano()),
-			Username:     username,
-			PasswordHash: string(hash),
-			Email:        email,
-			Name:         name,
-			IsAdmin:      admin,
+			Subject:       fmt.Sprintf("user-%s-%d", username, time.Now().UnixNano()),
+			Username:      username,
+			PasswordHash:  string(hash),
+			Email:         email,
+			EmailVerified: verified,
+			Name:          name,
+			IsAdmin:       admin,
 		}
 		if err := st.CreateUser(u); err != nil {
 			return err
@@ -195,8 +220,33 @@ var userAddCmd = &cobra.Command{
 			role = " [admin]"
 		}
 		fmt.Printf("✓ User '%s' created (subject: %s)%s\n", username, u.Subject, role)
+		if !verified && email != "" {
+			if err := sendVerificationEmail(u.Subject, email, username); err != nil {
+				fmt.Printf("! Could not send verification email: %v\n", err)
+			} else {
+				fmt.Printf("  Verification email sent to %s\n", email)
+			}
+		}
 		return nil
 	},
+}
+
+// sendVerificationEmail issues a single-use verification token and emails
+// the confirmation link. Used both here (right after user creation) and
+// from the running server's portal "resend" action.
+func sendVerificationEmail(subject, toEmail, username string) error {
+	internal, err := st.GetInternalProvider()
+	if err != nil {
+		return fmt.Errorf("provider not initialized — run 'provider self init' first")
+	}
+	token := secrets.RandomToken(32)
+	if err := st.SaveEmailVerification(token, subject); err != nil {
+		return err
+	}
+	link := internal.Issuer + "/verify-email?token=" + token
+	body := "Welcome to Access-Nex, " + username + ".\n\nConfirm your email address: " + link +
+		"\n\nThis link expires in 24 hours.\n"
+	return mailer.Send(toEmail, "Verify your Access-Nex email address", body)
 }
 
 var userListCmd = &cobra.Command{
@@ -755,9 +805,23 @@ var serverCmd = &cobra.Command{
 
 		internal, err := st.GetInternalProvider()
 		if errors.Is(err, store.ErrNotFound) {
-			return fmt.Errorf("provider not initialized — run 'provider self init' first")
-		}
-		if err != nil {
+			// Auto-initialize on first run rather than requiring a separate
+			// `provider self init` step — this matters for container images
+			// (no shell to script the two-step sequence with) and is just
+			// friendlier for local use too.
+			issuerFlag, _ := cmd.Flags().GetString("issuer")
+			if issuerFlag == "" {
+				issuerFlag = defaultIssuer
+			}
+			if err := st.UpsertInternalProvider(strings.TrimRight(issuerFlag, "/")); err != nil {
+				return fmt.Errorf("initialize provider: %w", err)
+			}
+			fmt.Printf("✓ Local OIDC Provider auto-initialized (issuer: %s)\n", issuerFlag)
+			internal, err = st.GetInternalProvider()
+			if err != nil {
+				return err
+			}
+		} else if err != nil {
 			return err
 		}
 		issuer := internal.Issuer
@@ -782,7 +846,25 @@ var serverCmd = &cobra.Command{
 			return err
 		}
 
-		srv := server.New(issuer, keys, st, box)
+		requireDPoPNonce, _ := cmd.Flags().GetBool("dpop-require-nonce")
+		frontendOrigins, _ := cmd.Flags().GetStringSlice("frontend-origin")
+		logFormat, _ := cmd.Flags().GetString("log-format")
+		logLevel, _ := cmd.Flags().GetString("log-level")
+		logger, err := newLogger(logFormat, logLevel)
+		if err != nil {
+			return err
+		}
+
+		srv := server.New(server.Config{
+			Issuer:           issuer,
+			Keys:             keys,
+			Store:            st,
+			Box:              box,
+			Mailer:           mailer,
+			Logger:           logger,
+			RequireDPoPNonce: requireDPoPNonce,
+			FrontendOrigins:  frontendOrigins,
+		})
 
 		// Purge expired codes, tokens, and sessions in the background.
 		go func() {

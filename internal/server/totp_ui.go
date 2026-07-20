@@ -7,7 +7,6 @@ package server
 import (
 	"encoding/base64"
 	"html/template"
-	"log"
 	"net/http"
 
 	"github.com/skip2/go-qrcode"
@@ -17,34 +16,49 @@ import (
 
 // renderTOTPChallenge is the second-factor entry page shown mid-OAuth-flow
 // (from /authorize), mirroring renderLogin's hidden-field round-tripping.
+// The totp_token field always renders (WebAuthn's JS locates it by name
+// even when the TOTP code input itself is hidden for a WebAuthn-only user).
+// {{.WebAuthnJS}} is pre-rendered HTML (a button + inline script), not
+// escaped text, hence html/template.HTML rather than string.
 var totpChallengeTemplate = template.Must(template.New("totp").Parse(`<!doctype html>
 <html lang="en"><head><meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1"><title>Two-Factor — Access-Nex</title>` + loginStyle + `</head><body>
 <div class="card">
   <div class="logo">🔐 Access-Nex</div><div class="sub">Two-Factor Authentication</div>
   {{if .Error}}<div class="error">{{.Error}}</div>{{end}}
-  <h1>Enter your code</h1>
+  <h1>Verify it's you</h1>
   {{if .ClientName}}<div class="app-info"><strong>Signing in to:</strong><br>{{.ClientName}}</div>{{end}}
-  <p class="hint">Open your authenticator app and enter the current 6-digit code.</p>
   <form method="post" action="/authorize">
     {{range $k,$v := .Fields}}{{if $v}}<input type="hidden" name="{{$k}}" value="{{$v}}">{{end}}{{end}}
     <input type="hidden" name="totp_token" value="{{.Token}}">
+    {{if .HasTOTP}}
+    <p class="hint">Open your authenticator app and enter the current 6-digit code.</p>
     <label for="c">Code</label>
     <input type="text" id="c" name="totp_code" inputmode="numeric" pattern="[0-9]*" maxlength="6" autocomplete="one-time-code" required autofocus>
     <button type="submit">Verify</button>
+    {{end}}
   </form>
+  {{.WebAuthnJS}}
 </div></body></html>`))
 
-func (s *Server) renderTOTPChallenge(w http.ResponseWriter, req authRequest, clientName, token, errMsg string) {
+func (s *Server) renderTOTPChallenge(w http.ResponseWriter, req authRequest, clientName, subject, token, errMsg string) {
+	user := s.userBySubject(subject)
 	data := struct {
 		Error      string
 		ClientName string
 		Token      string
 		Fields     map[string]string
-	}{Error: errMsg, ClientName: clientName, Token: token, Fields: req.fields()}
+		HasTOTP    bool
+		WebAuthnJS template.HTML
+	}{Error: errMsg, ClientName: clientName, Token: token, Fields: req.fields(), HasTOTP: user != nil && user.TOTPEnabled}
+	if s.hasWebAuthnCredentials(subject) {
+		redirectTo := "/authorize?" + authorizeQuery(req)
+		onSuccess := `window.location.href = ` + jsonString(redirectTo) + `;`
+		data.WebAuthnJS = template.HTML(webauthnSecurityKeyButton() + webauthnJSHelpers() + webauthnLoginScript("form", onSuccess))
+	}
 	w.Header().Set("Content-Type", "text/html; charset=utf-8")
 	if err := totpChallengeTemplate.Execute(w, data); err != nil {
-		log.Printf("render totp challenge: %v", err)
+		s.log.Error("render totp challenge", "error", err)
 	}
 }
 
@@ -93,12 +107,36 @@ func (s *Server) handleTOTPPage(w http.ResponseWriter, r *http.Request) {
     <form method="POST" action="/portal/2fa/enroll"><button type="submit">Set Up 2FA</button></form>`
 	}
 
+	securityKeysBody := ""
+	if s.webauthn.enabled() {
+		creds, _ := s.store.ListWebAuthnCredentials(user.ID)
+		rows := ""
+		for _, c := range creds {
+			rows += `<tr><td>` + esc(c.Name) + `</td><td>` + c.CreatedAt.Format("2006-01-02") + `</td><td>
+			<form method="POST" action="/portal/webauthn/delete" style="margin:0">
+			  <input type="hidden" name="credential_id" value="` + esc(c.ID) + `">
+			  <button type="submit" class="del">Remove</button>
+			</form></td></tr>`
+		}
+		if rows == "" {
+			rows = `<tr><td colspan="3" style="text-align:center;color:#999;padding:16px">No security keys registered</td></tr>`
+		}
+		securityKeysBody = `
+  <table style="margin-bottom:16px"><tr><th>Name</th><th>Added</th><th></th></tr>` + rows + `</table>
+  <button class="btn" onclick="registerSecurityKey()">+ Add a Security Key</button>
+  <p id="wa-reg-msg" style="margin-top:8px;font-size:13px;color:#888"></p>` + webauthnJSHelpers() + webauthnRegisterScript()
+	}
+
 	page := `<!doctype html><html lang="en"><head><meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1"><title>Two-Factor — Access-Nex</title>` + pageStyle + `</head><body>
 <div class="header"><h1>🔐 Two-Factor Authentication</h1></div>
-<div class="container"><div class="section">` + body + `
+<div class="container">
+  <div class="section"><h2>Authenticator App (TOTP)</h2>` + body + `</div>
+  <div class="section"><h2>Security Keys &amp; Passkeys</h2>
+    <p class="hint" style="margin-bottom:14px">Use a hardware security key, or your device's built-in passkey support (Windows Hello, Touch ID, …), as a second factor.</p>` + securityKeysBody + `
+  </div>
   <p style="margin-top:16px"><a href="/portal">← Back to portal</a></p>
-</div></div></body></html>`
+</div></body></html>`
 	w.Header().Set("Content-Type", "text/html; charset=utf-8")
 	w.Write([]byte(page))
 }

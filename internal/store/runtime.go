@@ -248,6 +248,8 @@ func (s *Store) CleanupExpired() error {
 		`DELETE FROM refresh_tokens WHERE expires_at <= ?`,
 		`DELETE FROM sessions WHERE expires_at <= ?`,
 		`DELETE FROM device_codes WHERE expires_at <= ?`,
+		`DELETE FROM password_resets WHERE expires_at <= ?`,
+		`DELETE FROM email_verifications WHERE expires_at <= ?`,
 	} {
 		if _, err := s.db.Exec(q, nowStr); err != nil {
 			return err

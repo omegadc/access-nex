@@ -13,7 +13,6 @@ package server
 //     own browser session with that app (OpenID Connect Front-Channel
 //     Logout 1.0).
 import (
-	"log"
 	"net/http"
 	"net/url"
 	"strings"
@@ -29,7 +28,7 @@ import (
 func (s *Server) notifyBackchannelLogout(subject string) {
 	apps, err := s.store.ListAppsForSubject(subject)
 	if err != nil {
-		log.Printf("backchannel logout: list apps: %v", err)
+		s.log.Error("backchannel logout: list apps", "error", err)
 		return
 	}
 	for _, a := range apps {
@@ -47,13 +46,13 @@ func (s *Server) sendBackchannelLogout(app *models.App, subject string) {
 		"events": map[string]any{"http://schemas.openid.net/event/backchannel-logout": map[string]any{}},
 	})
 	if err != nil {
-		log.Printf("backchannel logout: sign token for %s: %v", app.ID, err)
+		s.log.Error("backchannel logout: sign token", "client_id", app.ID, "error", err)
 		return
 	}
 	client := &http.Client{Timeout: 5 * time.Second}
 	resp, err := client.PostForm(app.BackchannelLogoutURI, url.Values{"logout_token": {token}})
 	if err != nil {
-		log.Printf("backchannel logout: %s: %v", app.ID, err)
+		s.log.Warn("backchannel logout: delivery failed", "client_id", app.ID, "error", err)
 		s.store.Audit("backchannel_logout_failed", subject, app.ID, "", err.Error())
 		return
 	}
