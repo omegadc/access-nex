@@ -3,7 +3,7 @@
 package cli
 
 import (
-	"database/sql"
+	"crypto/tls"
 	"errors"
 	"fmt"
 	"net/http"
@@ -29,7 +29,8 @@ const (
 
 var (
 	configDir string
-	db        *sql.DB
+	dbDSN     string
+	db        *database.DB
 	st        *store.Store
 )
 
@@ -49,8 +50,17 @@ var rootCmd = &cobra.Command{
 	SilenceUsage:  true,
 	SilenceErrors: false,
 	PersistentPreRunE: func(cmd *cobra.Command, args []string) error {
+		// configDir always holds the AES box key and (legacy) signing key
+		// files, regardless of which database backend is in use.
+		if err := os.MkdirAll(configDir, 0o755); err != nil {
+			return fmt.Errorf("create config dir: %w", err)
+		}
 		var err error
-		db, err = database.Open(configDir)
+		dsn := dbDSN
+		if dsn == "" {
+			dsn = configDir // default: SQLite file inside the config dir
+		}
+		db, err = database.Open(dsn)
 		if err != nil {
 			return err
 		}
@@ -61,7 +71,9 @@ var rootCmd = &cobra.Command{
 
 func init() {
 	rootCmd.PersistentFlags().StringVar(&configDir, "config", defaultConfigDir,
-		"config directory (holds the SQLite database and key files)")
+		"config directory (holds the SQLite database, AES key, and legacy signing key files)")
+	rootCmd.PersistentFlags().StringVar(&dbDSN, "db", "",
+		"database DSN; postgres://user:pass@host/db to use PostgreSQL, otherwise SQLite in --config is used")
 
 	rootCmd.AddCommand(userCmd, appCmd, providerCmd, serverCmd, shutdownCmd, migrateCmd, auditCmd)
 
@@ -93,6 +105,8 @@ func init() {
 	appUpdateCmd.Flags().StringP("provider", "p", "", "External provider ID")
 	appUpdateCmd.Flags().StringP("scopes", "s", "", "Scopes")
 	appUpdateCmd.Flags().String("id-token-enc-key", "", "Path to RSA public key PEM for ID-token encryption (JWE); 'none' to disable")
+	appUpdateCmd.Flags().String("backchannel-logout-uri", "", "URI notified server-to-server when a user's session ends; 'none' to disable")
+	appUpdateCmd.Flags().String("frontchannel-logout-uri", "", "URI loaded in a browser iframe when a user's session ends; 'none' to disable")
 	appDeleteCmd.Flags().StringP("id", "i", "", "Application ID")
 
 	// provider self
@@ -126,6 +140,20 @@ func init() {
 		providerShowCmd, providerUpdateCmd, providerDeleteCmd)
 
 	serverCmd.Flags().StringP("addr", "a", defaultAddr, "Listen address")
+	serverCmd.Flags().String("tls-cert", "", "Path to a TLS certificate (PEM); requires --tls-key")
+	serverCmd.Flags().String("tls-key", "", "Path to the TLS certificate's private key (PEM); requires --tls-cert")
+	serverCmd.Flags().Bool("tls-self-signed", false, "Serve HTTPS with an in-memory self-signed certificate (dev/local use)")
+
+	// group
+	groupCmd.AddCommand(groupCreateCmd, groupListCmd, groupDeleteCmd, groupAddMemberCmd, groupRemoveMemberCmd)
+	groupCreateCmd.Flags().StringP("name", "n", "", "Group name")
+	groupCreateCmd.Flags().StringP("description", "d", "", "Description")
+	groupDeleteCmd.Flags().StringP("name", "n", "", "Group name")
+	groupAddMemberCmd.Flags().StringP("group", "g", "", "Group name")
+	groupAddMemberCmd.Flags().StringP("username", "u", "", "Username to add")
+	groupRemoveMemberCmd.Flags().StringP("group", "g", "", "Group name")
+	groupRemoveMemberCmd.Flags().StringP("username", "u", "", "Username to remove")
+	rootCmd.AddCommand(groupCmd)
 }
 
 // ── user commands ─────────────────────────────────────────────────────────────
@@ -400,6 +428,18 @@ var appUpdateCmd = &cobra.Command{
 				}
 				a.IDTokenEncKey = string(pemBytes)
 			}
+		}
+		if v, _ := cmd.Flags().GetString("backchannel-logout-uri"); v != "" {
+			if v == "none" {
+				v = ""
+			}
+			a.BackchannelLogoutURI = v
+		}
+		if v, _ := cmd.Flags().GetString("frontchannel-logout-uri"); v != "" {
+			if v == "none" {
+				v = ""
+			}
+			a.FrontchannelLogoutURI = v
 		}
 		if err := st.UpdateApp(a); err != nil {
 			return err
@@ -705,6 +745,13 @@ var serverCmd = &cobra.Command{
 	Short: "Start the OIDC/OAuth2 server",
 	RunE: func(cmd *cobra.Command, args []string) error {
 		addr, _ := cmd.Flags().GetString("addr")
+		tlsCert, _ := cmd.Flags().GetString("tls-cert")
+		tlsKey, _ := cmd.Flags().GetString("tls-key")
+		tlsSelfSigned, _ := cmd.Flags().GetBool("tls-self-signed")
+		if (tlsCert == "") != (tlsKey == "") {
+			return fmt.Errorf("--tls-cert and --tls-key must be given together")
+		}
+		useTLS := tlsCert != "" || tlsSelfSigned
 
 		internal, err := st.GetInternalProvider()
 		if errors.Is(err, store.ErrNotFound) {
@@ -716,6 +763,9 @@ var serverCmd = &cobra.Command{
 		issuer := internal.Issuer
 		if issuer == "" {
 			issuer = defaultIssuer
+		}
+		if useTLS && !strings.HasPrefix(issuer, "https://") {
+			fmt.Printf("! Warning: serving HTTPS but issuer is %q — run 'provider self init --issuer https://...' so cookies and issued URLs match.\n", issuer)
 		}
 
 		box, err := secrets.NewBox(configDir)
@@ -745,7 +795,11 @@ var serverCmd = &cobra.Command{
 			}
 		}()
 
-		fmt.Printf("\n✓ OIDC/OAuth2 provider starting on %s\n", addr)
+		scheme := "http"
+		if useTLS {
+			scheme = "https"
+		}
+		fmt.Printf("\n✓ OIDC/OAuth2 provider starting on %s://%s\n", scheme, addr)
 		fmt.Printf("  Issuer:          %s\n", issuer)
 		fmt.Printf("  Users:           %d\n", users)
 		fmt.Printf("  Applications:    %d\n", apps)
@@ -753,7 +807,21 @@ var serverCmd = &cobra.Command{
 		fmt.Printf("  OAuth Proxy:     %s/oauth/start\n", issuer)
 		fmt.Printf("  Discovery:       %s/.well-known/openid-configuration\n\n", issuer)
 
-		return http.ListenAndServe(addr, srv.Handler())
+		if !useTLS {
+			return http.ListenAndServe(addr, srv.Handler())
+		}
+		httpSrv := &http.Server{Addr: addr, Handler: srv.Handler()}
+		if tlsSelfSigned {
+			cert, err := secrets.GenerateSelfSignedCert([]string{"localhost", "127.0.0.1", "::1"})
+			if err != nil {
+				return fmt.Errorf("generate self-signed cert: %w", err)
+			}
+			fmt.Println("  TLS:             self-signed (browsers will warn; fine for local/dev use)")
+			httpSrv.TLSConfig = &tls.Config{Certificates: []tls.Certificate{cert}}
+			return httpSrv.ListenAndServeTLS("", "")
+		}
+		fmt.Printf("  TLS:             %s\n", tlsCert)
+		return httpSrv.ListenAndServeTLS(tlsCert, tlsKey)
 	},
 }
 

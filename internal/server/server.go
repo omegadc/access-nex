@@ -45,10 +45,21 @@ type Server struct {
 
 	mu          sync.Mutex
 	oauthStates map[string]*models.OAuthProxyState
+	totpPending map[string]*pendingTOTP
+
+	dpopMu   sync.Mutex
+	dpopSeen map[string]time.Time // DPoP proof jti → seen-at, replay cache
 
 	corsMu      sync.Mutex
 	corsOrigins map[string]bool
 	corsLoaded  time.Time
+}
+
+// pendingTOTP is the short-lived server-side state between "password
+// verified" and "TOTP code verified" for accounts with 2FA enabled.
+type pendingTOTP struct {
+	Subject   string
+	ExpiresAt time.Time
 }
 
 // New builds a Server. keys must be non-empty with the active key first.
@@ -62,6 +73,8 @@ func New(issuer string, keys []SigningKey, st *store.Store, box *secrets.Box) *S
 		loginLimiter:  newRateLimiter(10, time.Minute),
 		tokenLimiter:  newRateLimiter(60, time.Minute),
 		oauthStates:   make(map[string]*models.OAuthProxyState),
+		totpPending:   make(map[string]*pendingTOTP),
+		dpopSeen:      make(map[string]time.Time),
 	}
 }
 
@@ -92,8 +105,23 @@ func (s *Server) Handler() http.Handler {
 
 	// Portal
 	mux.HandleFunc("/login", s.handleLogin)
+	mux.HandleFunc("/login/2fa", s.handleLoginTOTP)
 	mux.HandleFunc("/portal", s.handlePortal)
 	mux.HandleFunc("/portal/logout", s.handlePortalLogout)
+
+	// Portal self-service
+	mux.HandleFunc("GET /portal/2fa", s.handleTOTPPage)
+	mux.HandleFunc("POST /portal/2fa/enroll", s.handleTOTPEnroll)
+	mux.HandleFunc("POST /portal/2fa/confirm", s.handleTOTPConfirm)
+	mux.HandleFunc("POST /portal/2fa/disable", s.handleTOTPDisable)
+	mux.HandleFunc("POST /portal/password", s.handlePortalChangePassword)
+	mux.HandleFunc("POST /portal/grants/revoke", s.handlePortalRevokeGrant)
+	mux.HandleFunc("POST /portal/sessions/revoke", s.handlePortalRevokeSession)
+	mux.HandleFunc("POST /portal/identities/unlink", s.handlePortalUnlinkIdentity)
+
+	// RFC 8628 device authorization grant
+	mux.HandleFunc("POST /device_authorize", s.handleDeviceAuthorize)
+	mux.HandleFunc("/device", s.handleDeviceVerify)
 
 	// Admin UI + JSON API (session + is_admin required)
 	mux.HandleFunc("GET /admin", s.requireAdminPage(s.handleAdminPage))
@@ -192,32 +220,6 @@ func (s *Server) userBySubject(subject string) *models.User {
 	return u
 }
 
-// authenticateUser verifies a username/password against the users table,
-// enforcing the failed-login lockout and writing audit entries.
-func (s *Server) authenticateUser(username, password, ip string) (string, bool) {
-	u, err := s.store.GetUserByUsername(username)
-	if err != nil || u.PasswordHash == "" {
-		s.store.Audit("login_failed", "", "", ip, "unknown user or passwordless account: "+username)
-		return "", false
-	}
-	if !u.LockedUntil.IsZero() && time.Now().Before(u.LockedUntil) {
-		s.store.Audit("login_locked", u.Subject, "", ip, "account locked until "+u.LockedUntil.Format(time.RFC3339))
-		return "", false
-	}
-	if bcrypt.CompareHashAndPassword([]byte(u.PasswordHash), []byte(password)) != nil {
-		locked, _ := s.store.RegisterLoginFailure(username, maxLoginFails, lockoutDuration)
-		detail := "wrong password"
-		if locked {
-			detail = "wrong password; account locked"
-		}
-		s.store.Audit("login_failed", u.Subject, "", ip, detail)
-		return "", false
-	}
-	_ = s.store.ClearLoginFailures(username)
-	s.store.Audit("login_success", u.Subject, "", ip, "")
-	return u.Subject, true
-}
-
 // authenticateClient validates client credentials on token-style endpoints.
 func (s *Server) authenticateClient(r *http.Request) (*models.App, string) {
 	clientID, secret, basic := r.BasicAuth()
@@ -290,4 +292,57 @@ func (s *Server) subjectFromSession(r *http.Request) (string, bool) {
 		return "", false
 	}
 	return session.Subject, true
+}
+
+// ── TOTP second-factor pending state ──────────────────────────────────────────
+
+// verifyPassword checks a username/password pair, enforcing lockout and
+// writing audit entries, but does not start a session — callers decide
+// whether a second factor (TOTP) is required first.
+func (s *Server) verifyPassword(username, password, ip string) (*models.User, bool) {
+	u, err := s.store.GetUserByUsername(username)
+	if err != nil || u.PasswordHash == "" {
+		s.store.Audit("login_failed", "", "", ip, "unknown user or passwordless account: "+username)
+		return nil, false
+	}
+	if !u.LockedUntil.IsZero() && time.Now().Before(u.LockedUntil) {
+		s.store.Audit("login_locked", u.Subject, "", ip, "account locked until "+u.LockedUntil.Format(time.RFC3339))
+		return nil, false
+	}
+	if bcrypt.CompareHashAndPassword([]byte(u.PasswordHash), []byte(password)) != nil {
+		locked, _ := s.store.RegisterLoginFailure(username, maxLoginFails, lockoutDuration)
+		detail := "wrong password"
+		if locked {
+			detail = "wrong password; account locked"
+		}
+		s.store.Audit("login_failed", u.Subject, "", ip, detail)
+		return nil, false
+	}
+	_ = s.store.ClearLoginFailures(username)
+	return u, true
+}
+
+// newTOTPPending records that a user passed their password and now owes a
+// TOTP code, returning an opaque token identifying that pending login.
+func (s *Server) newTOTPPending(subject string) string {
+	token := secrets.RandomToken(24)
+	s.mu.Lock()
+	s.totpPending[token] = &pendingTOTP{Subject: subject, ExpiresAt: time.Now().Add(5 * time.Minute)}
+	s.mu.Unlock()
+	return token
+}
+
+// consumeTOTPPending resolves and invalidates a pending-TOTP token.
+func (s *Server) consumeTOTPPending(token string) (string, bool) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	p := s.totpPending[token]
+	if p == nil {
+		return "", false
+	}
+	delete(s.totpPending, token)
+	if time.Now().After(p.ExpiresAt) {
+		return "", false
+	}
+	return p.Subject, true
 }

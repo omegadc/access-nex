@@ -49,18 +49,22 @@ func (s *Server) handleHealth(w http.ResponseWriter, r *http.Request) {
 
 func (s *Server) handleDiscovery(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, map[string]any{
-		"issuer":                                        s.issuer,
-		"authorization_endpoint":                        s.endpoint("/authorize"),
-		"token_endpoint":                                s.endpoint("/token"),
-		"userinfo_endpoint":                             s.endpoint("/userinfo"),
-		"jwks_uri":                                      s.endpoint("/jwks"),
-		"revocation_endpoint":                           s.endpoint("/revoke"),
-		"introspection_endpoint":                        s.endpoint("/introspect"),
-		"registration_endpoint":                         s.endpoint("/register"),
-		"end_session_endpoint":                          s.endpoint("/end_session"),
-		"response_types_supported":                      []string{"code"},
-		"response_modes_supported":                      []string{"query", "form_post"},
-		"grant_types_supported":                         []string{"authorization_code", "refresh_token", "client_credentials"},
+		"issuer":                        s.issuer,
+		"authorization_endpoint":        s.endpoint("/authorize"),
+		"token_endpoint":                s.endpoint("/token"),
+		"userinfo_endpoint":             s.endpoint("/userinfo"),
+		"jwks_uri":                      s.endpoint("/jwks"),
+		"revocation_endpoint":           s.endpoint("/revoke"),
+		"introspection_endpoint":        s.endpoint("/introspect"),
+		"registration_endpoint":         s.endpoint("/register"),
+		"end_session_endpoint":          s.endpoint("/end_session"),
+		"device_authorization_endpoint": s.endpoint("/device_authorize"),
+		"response_types_supported":      []string{"code"},
+		"response_modes_supported":      []string{"query", "form_post"},
+		"grant_types_supported": []string{
+			"authorization_code", "refresh_token", "client_credentials",
+			deviceGrantType, tokenExchangeGrantType,
+		},
 		"subject_types_supported":                       []string{"public"},
 		"id_token_signing_alg_values_supported":         []string{"RS256"},
 		"id_token_encryption_alg_values_supported":      []string{"RSA-OAEP-256"},
@@ -68,10 +72,11 @@ func (s *Server) handleDiscovery(w http.ResponseWriter, r *http.Request) {
 		"token_endpoint_auth_methods_supported":         []string{"client_secret_basic", "client_secret_post", "none"},
 		"revocation_endpoint_auth_methods_supported":    []string{"client_secret_basic", "client_secret_post", "none"},
 		"introspection_endpoint_auth_methods_supported": []string{"client_secret_basic", "client_secret_post", "none"},
-		"scopes_supported":                              []string{"openid", "profile", "email", "offline_access"},
-		"claims_supported":                              []string{"sub", "iss", "aud", "exp", "iat", "auth_time", "nonce", "email", "name", "preferred_username"},
+		"scopes_supported":                              []string{"openid", "profile", "email", "offline_access", "groups"},
+		"claims_supported":                              []string{"sub", "iss", "aud", "exp", "iat", "auth_time", "nonce", "email", "name", "preferred_username", "groups"},
 		"code_challenge_methods_supported":              []string{"S256", "plain"},
 		"prompt_values_supported":                       []string{"none", "login", "consent", "select_account"},
+		"dpop_signing_alg_values_supported":             []string{"RS256", "ES256"},
 	})
 }
 
@@ -149,6 +154,25 @@ func (s *Server) handleAuthorize(w http.ResponseWriter, r *http.Request) {
 	forceConsent := hasScope(prompts, "consent")
 	promptNone := hasScope(prompts, "none")
 
+	// Second factor submitted from the TOTP entry page.
+	if r.Method == http.MethodPost && r.Form.Get("totp_code") != "" {
+		pendingSubject, ok := s.consumeTOTPPending(r.Form.Get("totp_token"))
+		if !ok {
+			s.renderLogin(w, req, client.Name, "Session expired — sign in again")
+			return
+		}
+		user := s.userBySubject(pendingSubject)
+		if user == nil || !secrets.VerifyTOTP(user.TOTPSecret, r.Form.Get("totp_code")) {
+			s.store.Audit("login_2fa_failed", pendingSubject, client.ID, clientIP(r), "")
+			s.renderTOTPChallenge(w, req, client.Name, s.newTOTPPending(pendingSubject), "Invalid code — try again")
+			return
+		}
+		s.store.Audit("login_success", pendingSubject, client.ID, clientIP(r), "with 2FA")
+		s.startSession(w, pendingSubject)
+		s.continueAuthorizeAfterLogin(w, r, req, client, pendingSubject, forceConsent, promptNone)
+		return
+	}
+
 	// Consent decision submitted from the consent page.
 	if r.Method == http.MethodPost && r.Form.Get("consent") != "" {
 		subject, ok := s.subjectFromSession(r)
@@ -187,13 +211,18 @@ func (s *Server) handleAuthorize(w http.ResponseWriter, r *http.Request) {
 				s.renderLogin(w, req, client.Name, "Too many attempts — try again in a minute")
 				return
 			}
-			sub, ok := s.authenticateUser(r.Form.Get("username"), r.Form.Get("password"), clientIP(r))
+			user, ok := s.verifyPassword(r.Form.Get("username"), r.Form.Get("password"), clientIP(r))
 			if !ok {
 				s.renderLogin(w, req, client.Name, "Invalid username or password")
 				return
 			}
-			s.startSession(w, sub)
-			subject = sub
+			if user.TOTPEnabled {
+				s.renderTOTPChallenge(w, req, client.Name, s.newTOTPPending(user.Subject), "")
+				return
+			}
+			s.store.Audit("login_success", user.Subject, client.ID, clientIP(r), "")
+			s.startSession(w, user.Subject)
+			subject = user.Subject
 			// prompt=login is satisfied by the fresh authentication.
 			forceLogin = false
 		} else {
@@ -202,7 +231,13 @@ func (s *Server) handleAuthorize(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
-	// Consent: skip only when a remembered grant covers all requested scopes.
+	s.continueAuthorizeAfterLogin(w, r, req, client, subject, forceConsent, promptNone)
+}
+
+// continueAuthorizeAfterLogin runs the consent check and issues the
+// authorization code once a subject is fully authenticated (password, and
+// TOTP if enabled). Shared by the password-login and TOTP-verification paths.
+func (s *Server) continueAuthorizeAfterLogin(w http.ResponseWriter, r *http.Request, req authRequest, client *models.App, subject string, forceConsent, promptNone bool) {
 	scope := parseScope(req.Scope)
 	granted, err := s.store.HasGrant(subject, client.ID, scope)
 	if err != nil {
@@ -298,13 +333,30 @@ func (s *Server) handleToken(w http.ResponseWriter, r *http.Request) {
 		writeOAuthError(w, http.StatusUnauthorized, "invalid_client", authErr)
 		return
 	}
+
+	// A client presenting a DPoP proof on this request gets a sender-
+	// constrained token back (cnf.jkt), binding it to their private key.
+	var jkt string
+	if r.Header.Get("DPoP") != "" {
+		var proofErr string
+		jkt, proofErr = s.dpopProofFromRequest(r)
+		if proofErr != "" {
+			writeOAuthError(w, http.StatusBadRequest, "invalid_dpop_proof", proofErr)
+			return
+		}
+	}
+
 	switch r.Form.Get("grant_type") {
 	case "authorization_code":
-		s.handleAuthorizationCodeGrant(w, r, client)
+		s.handleAuthorizationCodeGrant(w, r, client, jkt)
 	case "refresh_token":
-		s.handleRefreshTokenGrant(w, r, client)
+		s.handleRefreshTokenGrant(w, r, client, jkt)
 	case "client_credentials":
-		s.handleClientCredentialsGrant(w, r, client)
+		s.handleClientCredentialsGrant(w, r, client, jkt)
+	case deviceGrantType:
+		s.handleDeviceCodeGrant(w, r, client, jkt)
+	case tokenExchangeGrantType:
+		s.handleTokenExchangeGrant(w, r, client, jkt)
 	default:
 		writeOAuthError(w, http.StatusBadRequest, "unsupported_grant_type", "Unsupported grant_type")
 	}
@@ -322,7 +374,7 @@ func (s *Server) parseAudiences(r *http.Request) ([]string, error) {
 	return audiences, nil
 }
 
-func (s *Server) handleAuthorizationCodeGrant(w http.ResponseWriter, r *http.Request, client *models.App) {
+func (s *Server) handleAuthorizationCodeGrant(w http.ResponseWriter, r *http.Request, client *models.App, jkt string) {
 	codeValue := r.Form.Get("code")
 	if codeValue == "" {
 		writeOAuthError(w, http.StatusBadRequest, "invalid_request", "Missing code")
@@ -354,7 +406,7 @@ func (s *Server) handleAuthorizationCodeGrant(w http.ResponseWriter, r *http.Req
 		writeOAuthError(w, http.StatusBadRequest, "invalid_target", err.Error())
 		return
 	}
-	response, err := s.issueTokenResponse(client, code.Subject, code.Scope, audiences, code.Nonce, code.AuthTime, "")
+	response, err := s.issueTokenResponse(client, code.Subject, code.Scope, audiences, code.Nonce, code.AuthTime, "", jkt)
 	if err != nil {
 		writeOAuthError(w, http.StatusInternalServerError, "server_error", "Could not issue token")
 		return
@@ -363,7 +415,7 @@ func (s *Server) handleAuthorizationCodeGrant(w http.ResponseWriter, r *http.Req
 	writeJSON(w, http.StatusOK, response)
 }
 
-func (s *Server) handleRefreshTokenGrant(w http.ResponseWriter, r *http.Request, client *models.App) {
+func (s *Server) handleRefreshTokenGrant(w http.ResponseWriter, r *http.Request, client *models.App, jkt string) {
 	refreshToken := r.Form.Get("refresh_token")
 	if refreshToken == "" {
 		writeOAuthError(w, http.StatusBadRequest, "invalid_request", "Missing refresh_token")
@@ -380,7 +432,7 @@ func (s *Server) handleRefreshTokenGrant(w http.ResponseWriter, r *http.Request,
 	}
 	// The replacement refresh token stays in the same family so replay of
 	// the old token can revoke every descendant.
-	response, err := s.issueTokenResponse(client, refresh.Subject, refresh.Scope, nil, "", time.Now(), refresh.Family)
+	response, err := s.issueTokenResponse(client, refresh.Subject, refresh.Scope, nil, "", time.Now(), refresh.Family, jkt)
 	if err != nil {
 		writeOAuthError(w, http.StatusInternalServerError, "server_error", "Could not issue token")
 		return
@@ -389,7 +441,7 @@ func (s *Server) handleRefreshTokenGrant(w http.ResponseWriter, r *http.Request,
 	writeJSON(w, http.StatusOK, response)
 }
 
-func (s *Server) handleClientCredentialsGrant(w http.ResponseWriter, r *http.Request, client *models.App) {
+func (s *Server) handleClientCredentialsGrant(w http.ResponseWriter, r *http.Request, client *models.App, jkt string) {
 	if client.Public {
 		writeOAuthError(w, http.StatusUnauthorized, "unauthorized_client", "Public clients cannot use client_credentials")
 		return
@@ -403,7 +455,7 @@ func (s *Server) handleClientCredentialsGrant(w http.ResponseWriter, r *http.Req
 		writeOAuthError(w, http.StatusBadRequest, "invalid_target", err.Error())
 		return
 	}
-	record, err := s.issueAccessToken(client.ID, client.ID, scope, audiences)
+	record, err := s.issueAccessToken(client.ID, client.ID, scope, audiences, jkt, "")
 	if err != nil {
 		writeOAuthError(w, http.StatusInternalServerError, "server_error", "Could not issue token")
 		return
@@ -411,21 +463,30 @@ func (s *Server) handleClientCredentialsGrant(w http.ResponseWriter, r *http.Req
 	s.store.Audit("token_issued", client.ID, client.ID, clientIP(r), "client_credentials")
 	writeJSON(w, http.StatusOK, map[string]any{
 		"access_token": record.Token,
-		"token_type":   "Bearer",
+		"token_type":   tokenType(jkt),
 		"expires_in":   int(time.Until(record.ExpiresAt).Seconds()),
 		"scope":        strings.Join(scope, " "),
 	})
 }
 
+// tokenType is "DPoP" for sender-constrained tokens (RFC 9449 §5.1) and
+// "Bearer" otherwise.
+func tokenType(jkt string) string {
+	if jkt != "" {
+		return "DPoP"
+	}
+	return "Bearer"
+}
+
 // ── Token issuance ────────────────────────────────────────────────────────────
 
-func (s *Server) issueTokenResponse(client *models.App, subject string, scope, audiences []string, nonce string, authTime time.Time, refreshFamily string) (map[string]any, error) {
-	access, err := s.issueAccessToken(client.ID, subject, scope, audiences)
+func (s *Server) issueTokenResponse(client *models.App, subject string, scope, audiences []string, nonce string, authTime time.Time, refreshFamily, jkt string) (map[string]any, error) {
+	access, err := s.issueAccessToken(client.ID, subject, scope, audiences, jkt, "")
 	if err != nil {
 		return nil, err
 	}
 	resp := map[string]any{
-		"access_token": access.Token, "token_type": "Bearer",
+		"access_token": access.Token, "token_type": tokenType(jkt),
 		"expires_in": int(time.Until(access.ExpiresAt).Seconds()),
 		"scope":      strings.Join(scope, " "),
 	}
@@ -464,7 +525,7 @@ func (s *Server) issueTokenResponse(client *models.App, subject string, scope, a
 	return resp, nil
 }
 
-func (s *Server) issueAccessToken(clientID, subject string, scope, audiences []string) (*models.TokenRecord, error) {
+func (s *Server) issueAccessToken(clientID, subject string, scope, audiences []string, jkt, actor string) (*models.TokenRecord, error) {
 	now := time.Now()
 	expires := now.Add(time.Hour)
 	jti := secrets.RandomToken(24)
@@ -480,13 +541,23 @@ func (s *Server) issueAccessToken(clientID, subject string, scope, audiences []s
 		"scope": strings.Join(scope, " "), "exp": expires.Unix(), "iat": now.Unix(),
 		"jti": jti, "token_use": "access",
 	}
+	if jkt != "" {
+		// RFC 9449 confirmation claim: binds this token to the DPoP key
+		// whose thumbprint is jkt.
+		claims["cnf"] = map[string]string{"jkt": jkt}
+	}
+	if actor != "" {
+		// RFC 8693 actor claim: records that `actor` is acting on behalf of
+		// `subject`, for delegation tracing through a token exchange.
+		claims["act"] = map[string]string{"sub": actor}
+	}
 	token, err := s.signJWT(claims)
 	if err != nil {
 		return nil, err
 	}
 	record := &models.TokenRecord{
 		Token: token, JTI: jti, ClientID: clientID, Subject: subject,
-		Scope: scope, Audiences: audiences, ExpiresAt: expires,
+		Scope: scope, Audiences: audiences, JKT: jkt, ExpiresAt: expires,
 	}
 	if err := s.store.SaveAccessToken(record); err != nil {
 		return nil, err
@@ -514,6 +585,11 @@ func (s *Server) issueIDToken(clientID, subject string, scope []string, nonce st
 				claims["email"] = user.Email
 				claims["email_verified"] = true
 			}
+		}
+	}
+	if hasScope(scope, "groups") {
+		if names, err := s.store.GroupNamesForSubject(subject); err == nil {
+			claims["groups"] = names
 		}
 	}
 	return s.signJWT(claims)
@@ -607,7 +683,7 @@ func (s *Server) handleIntrospect(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) handleUserInfo(w http.ResponseWriter, r *http.Request) {
-	token := bearerToken(r)
+	scheme, token := authHeaderToken(r)
 	if token == "" {
 		w.Header().Set("WWW-Authenticate", `Bearer realm="userinfo"`)
 		writeOAuthError(w, http.StatusUnauthorized, "invalid_token", "Missing bearer token")
@@ -617,6 +693,26 @@ func (s *Server) handleUserInfo(w http.ResponseWriter, r *http.Request) {
 	if err != nil || record.Revoked || time.Now().After(record.ExpiresAt) {
 		w.Header().Set("WWW-Authenticate", `Bearer realm="userinfo", error="invalid_token"`)
 		writeOAuthError(w, http.StatusUnauthorized, "invalid_token", "Invalid or expired token")
+		return
+	}
+	// DPoP-bound tokens (issued with a cnf.jkt claim) must be presented with
+	// scheme "DPoP" and a fresh proof matching that thumbprint — otherwise a
+	// stolen token is useless without the corresponding private key.
+	if record.JKT != "" {
+		if !strings.EqualFold(scheme, "DPoP") {
+			w.Header().Set("WWW-Authenticate", `DPoP realm="userinfo", error="invalid_token"`)
+			writeOAuthError(w, http.StatusUnauthorized, "invalid_token", "This token requires the DPoP scheme")
+			return
+		}
+		jkt, proofErr := s.dpopProofFromRequest(r)
+		if proofErr != "" || jkt != record.JKT {
+			w.Header().Set("WWW-Authenticate", `DPoP realm="userinfo", error="invalid_token"`)
+			writeOAuthError(w, http.StatusUnauthorized, "invalid_token", "Missing or mismatched DPoP proof")
+			return
+		}
+	} else if !strings.EqualFold(scheme, "Bearer") {
+		w.Header().Set("WWW-Authenticate", `Bearer realm="userinfo", error="invalid_token"`)
+		writeOAuthError(w, http.StatusUnauthorized, "invalid_token", "Unexpected authorization scheme")
 		return
 	}
 	user := s.userBySubject(record.Subject)
@@ -637,6 +733,11 @@ func (s *Server) handleUserInfo(w http.ResponseWriter, r *http.Request) {
 	if hasScope(record.Scope, "email") {
 		claims["email"] = user.Email
 		claims["email_verified"] = true
+	}
+	if hasScope(record.Scope, "groups") {
+		if names, err := s.store.GroupNamesForSubject(user.Subject); err == nil {
+			claims["groups"] = names
+		}
 	}
 	writeJSON(w, http.StatusOK, claims)
 }
@@ -706,9 +807,19 @@ func (s *Server) handleRegister(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) handleEndSession(w http.ResponseWriter, r *http.Request) {
+	subject, hadSession := s.subjectFromSession(r)
 	s.endSession(w, r)
-	if u := r.URL.Query().Get("post_logout_redirect_uri"); u != "" {
-		http.Redirect(w, r, u, http.StatusFound)
+	redirectTo := r.URL.Query().Get("post_logout_redirect_uri")
+
+	if hadSession {
+		go s.notifyBackchannelLogout(subject)
+		if uris := s.frontchannelLogoutURIs(subject); len(uris) > 0 {
+			s.renderFrontchannelLogoutPage(w, uris, redirectTo)
+			return
+		}
+	}
+	if redirectTo != "" {
+		http.Redirect(w, r, redirectTo, http.StatusFound)
 		return
 	}
 	writeJSON(w, http.StatusOK, map[string]string{"status": "signed_out"})

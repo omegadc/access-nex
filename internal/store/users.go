@@ -13,7 +13,7 @@ import (
 var ErrNotFound = errors.New("not found")
 
 const userCols = `id, subject, username, password_hash, email, name, provider_id, external_id,
-	is_admin, failed_logins, locked_until, created_at, updated_at`
+	is_admin, failed_logins, locked_until, totp_secret, totp_enabled, created_at, updated_at`
 
 func scanUser(row interface{ Scan(...any) error }) (*models.User, error) {
 	var u models.User
@@ -21,7 +21,7 @@ func scanUser(row interface{ Scan(...any) error }) (*models.User, error) {
 	var locked, created, updated string
 	err := row.Scan(&u.ID, &u.Subject, &u.Username, &u.PasswordHash, &u.Email,
 		&u.Name, &providerID, &u.ExternalID,
-		&u.IsAdmin, &u.FailedLogins, &locked, &created, &updated)
+		&u.IsAdmin, &u.FailedLogins, &locked, &u.TOTPSecret, &u.TOTPEnabled, &created, &updated)
 	if err != nil {
 		if errors.Is(err, sql.ErrNoRows) {
 			return nil, ErrNotFound
@@ -61,6 +61,10 @@ func (s *Store) GetUserByUsername(username string) (*models.User, error) {
 
 func (s *Store) GetUserBySubject(subject string) (*models.User, error) {
 	return scanUser(s.db.QueryRow(`SELECT `+userCols+` FROM users WHERE subject = ?`, subject))
+}
+
+func (s *Store) GetUserByID(id int64) (*models.User, error) {
+	return scanUser(s.db.QueryRow(`SELECT `+userCols+` FROM users WHERE id = ?`, id))
 }
 
 // GetSoleUserByEmail returns the user with the given email only when exactly
@@ -224,4 +228,44 @@ func (s *Store) EnsureExternalUser(providerID, externalID, login, email, name st
 		return "", false, false, err
 	}
 	return u.Subject, true, false, nil
+}
+
+// ── Password & TOTP self-service ──────────────────────────────────────────────
+
+func (s *Store) UpdatePasswordHash(username, hash string) error {
+	res, err := s.db.Exec(`UPDATE users SET password_hash = ?, updated_at = ? WHERE username = ?`,
+		hash, now(), username)
+	if err != nil {
+		return err
+	}
+	if n, _ := res.RowsAffected(); n == 0 {
+		return ErrNotFound
+	}
+	return nil
+}
+
+// SetPendingTOTPSecret stores a secret awaiting confirmation (totp_enabled
+// stays false until ConfirmTOTP is called with a valid code).
+func (s *Store) SetPendingTOTPSecret(username, secret string) error {
+	_, err := s.db.Exec(`UPDATE users SET totp_secret = ?, totp_enabled = 0, updated_at = ? WHERE username = ?`,
+		secret, now(), username)
+	return err
+}
+
+func (s *Store) ConfirmTOTP(username string) error {
+	res, err := s.db.Exec(`UPDATE users SET totp_enabled = 1, updated_at = ? WHERE username = ? AND totp_secret != ''`,
+		now(), username)
+	if err != nil {
+		return err
+	}
+	if n, _ := res.RowsAffected(); n == 0 {
+		return ErrNotFound
+	}
+	return nil
+}
+
+func (s *Store) DisableTOTP(username string) error {
+	_, err := s.db.Exec(`UPDATE users SET totp_secret = '', totp_enabled = 0, updated_at = ? WHERE username = ?`,
+		now(), username)
+	return err
 }

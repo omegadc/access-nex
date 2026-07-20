@@ -26,6 +26,8 @@ type User struct {
 	IsAdmin      bool
 	FailedLogins int
 	LockedUntil  time.Time // zero = not locked
+	TOTPSecret   string    // base32, empty until enrolled
+	TOTPEnabled  bool
 	CreatedAt    time.Time
 	UpdatedAt    time.Time
 }
@@ -33,17 +35,19 @@ type User struct {
 // App is a row in the applications table: an OAuth2/OIDC client registration.
 // ProviderID selects which provider authenticates its users ("" = self).
 type App struct {
-	ID            string
-	Name          string
-	Secret        string // empty for public (PKCE) clients
-	Public        bool
-	ProviderID    string
-	RedirectURIs  []string
-	Scopes        []string
-	Enabled       bool
-	IDTokenEncKey string // PEM RSA public key; non-empty = encrypt ID tokens (JWE)
-	CreatedAt     time.Time
-	UpdatedAt     time.Time
+	ID                    string
+	Name                  string
+	Secret                string // empty for public (PKCE) clients
+	Public                bool
+	ProviderID            string
+	RedirectURIs          []string
+	Scopes                []string
+	Enabled               bool
+	IDTokenEncKey         string // PEM RSA public key; non-empty = encrypt ID tokens (JWE)
+	BackchannelLogoutURI  string // notified server-to-server when a session ends
+	FrontchannelLogoutURI string // loaded in a browser iframe when a session ends
+	CreatedAt             time.Time
+	UpdatedAt             time.Time
 }
 
 // Provider is a row in the providers table. It unifies the local provider
@@ -91,6 +95,7 @@ type TokenRecord struct {
 	Subject   string
 	Scope     []string
 	Audiences []string // extra audiences beyond the client itself
+	JKT       string   // RFC 7638 JWK thumbprint the token is DPoP-bound to; "" = bearer token
 	ExpiresAt time.Time
 	Revoked   bool
 }
@@ -138,6 +143,46 @@ type Session struct {
 	ID        string
 	Subject   string
 	ExpiresAt time.Time
+	CreatedAt time.Time
+	UserAgent string
+}
+
+// Identity links an external-provider account to a local user (account linking).
+type Identity struct {
+	ID         int64
+	UserID     int64
+	ProviderID string
+	ExternalID string
+	CreatedAt  time.Time
+}
+
+// Group is a role/team users can belong to; membership is exposed to clients
+// that request the "groups" scope as an ID-token/userinfo claim.
+type Group struct {
+	ID          int64
+	Name        string
+	Description string
+	CreatedAt   time.Time
+}
+
+// DeviceCode is a row in the RFC 8628 device authorization flow.
+const (
+	DeviceStatusPending  = "pending"
+	DeviceStatusApproved = "approved"
+	DeviceStatusDenied   = "denied"
+)
+
+type DeviceCode struct {
+	DeviceCode   string
+	UserCode     string
+	ClientID     string
+	Scope        []string
+	Status       string
+	Subject      string
+	IntervalSecs int
+	LastPolledAt time.Time
+	ExpiresAt    time.Time
+	CreatedAt    time.Time
 }
 
 // OAuthProxyState tracks an in-flight login against an external provider.

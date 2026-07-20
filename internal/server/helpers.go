@@ -51,11 +51,22 @@ func hasScope(scopes []string, needle string) bool {
 }
 
 func bearerToken(r *http.Request) string {
-	h := r.Header.Get("Authorization")
-	if len(h) < 7 || !strings.EqualFold(h[:7], "Bearer ") {
+	scheme, token := authHeaderToken(r)
+	if !strings.EqualFold(scheme, "Bearer") {
 		return ""
 	}
-	return strings.TrimSpace(h[7:])
+	return token
+}
+
+// authHeaderToken splits "Authorization: <scheme> <token>" into its parts,
+// e.g. ("Bearer", "eyJ...") or ("DPoP", "eyJ...").
+func authHeaderToken(r *http.Request) (scheme, token string) {
+	h := r.Header.Get("Authorization")
+	parts := strings.SplitN(h, " ", 2)
+	if len(parts) != 2 {
+		return "", ""
+	}
+	return parts[0], strings.TrimSpace(parts[1])
 }
 
 func redirectAllowed(client *models.App, redirectURI string) bool {

@@ -7,15 +7,18 @@ import (
 	"encoding/json"
 	"strings"
 	"time"
+
+	"github.com/omegadc/access-nex/internal/database"
 )
 
 // Store wraps the database handle. Create one with New and share it between
-// the CLI and the HTTP server.
+// the CLI and the HTTP server. All query text uses `?` placeholders; *database.DB
+// rebinds them transparently when the backend is PostgreSQL.
 type Store struct {
-	db *sql.DB
+	db *database.DB
 }
 
-func New(db *sql.DB) *Store {
+func New(db *database.DB) *Store {
 	return &Store{db: db}
 }
 

@@ -11,6 +11,7 @@ import (
 	"strings"
 
 	"github.com/omegadc/access-nex/internal/models"
+	"github.com/omegadc/access-nex/internal/secrets"
 )
 
 const pageStyle = `<style>
@@ -34,6 +35,7 @@ table{width:100%;border-collapse:collapse;font-size:14px}
 th{background:#f5f5f5;padding:11px 14px;text-align:left;font-weight:600;color:#667eea;border-bottom:2px solid #eee}
 td{padding:11px 14px;border-bottom:1px solid #f0f0f0;vertical-align:top}
 .badge{background:#d4edda;color:#155724;padding:3px 10px;border-radius:10px;font-size:12px;font-weight:600}
+.del{background:#fee2e2;color:#dc2626;border:none;border-radius:5px;padding:6px 14px;cursor:pointer;font-size:13px}
 .footer{text-align:center;padding:24px;color:#888;font-size:13px}
 </style>`
 
@@ -136,15 +138,78 @@ func (s *Server) handleLogin(w http.ResponseWriter, r *http.Request) {
 			s.renderDirectLoginPage(w, "Too many attempts — try again in a minute", returnTo)
 			return
 		}
-		if subject, ok := s.authenticateUser(r.Form.Get("username"), r.Form.Get("password"), clientIP(r)); ok {
-			s.startSession(w, subject)
-			http.Redirect(w, r, returnTo, http.StatusFound)
+		user, ok := s.verifyPassword(r.Form.Get("username"), r.Form.Get("password"), clientIP(r))
+		if !ok {
+			s.renderDirectLoginPage(w, "Invalid username or password", returnTo)
 			return
 		}
-		s.renderDirectLoginPage(w, "Invalid username or password", returnTo)
+		if user.TOTPEnabled {
+			token := s.newTOTPPending(user.Subject)
+			s.renderDirectTOTPPage(w, token, returnTo, "")
+			return
+		}
+		s.store.Audit("login_success", user.Subject, "", clientIP(r), "")
+		s.startSession(w, user.Subject)
+		http.Redirect(w, r, returnTo, http.StatusFound)
 		return
 	}
 	s.renderDirectLoginPage(w, "", returnTo)
+}
+
+// handleLoginTOTP verifies the second factor for a direct portal login
+// (started by handleLogin above).
+func (s *Server) handleLoginTOTP(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		http.Redirect(w, r, "/login", http.StatusFound)
+		return
+	}
+	if err := r.ParseForm(); err != nil {
+		http.Error(w, "bad request", http.StatusBadRequest)
+		return
+	}
+	token := r.Form.Get("totp_token")
+	returnTo := r.Form.Get("return_to")
+	if returnTo == "" {
+		returnTo = "/portal"
+	}
+	subject, ok := s.consumeTOTPPending(token)
+	if !ok {
+		s.renderDirectLoginPage(w, "Session expired — sign in again", returnTo)
+		return
+	}
+	user := s.userBySubject(subject)
+	if user == nil || !secrets.VerifyTOTP(user.TOTPSecret, r.Form.Get("totp_code")) {
+		s.store.Audit("login_2fa_failed", subject, "", clientIP(r), "")
+		s.renderDirectTOTPPage(w, s.newTOTPPending(subject), returnTo, "Invalid code — try again")
+		return
+	}
+	s.store.Audit("login_success", subject, "", clientIP(r), "with 2FA")
+	s.startSession(w, subject)
+	http.Redirect(w, r, returnTo, http.StatusFound)
+}
+
+func (s *Server) renderDirectTOTPPage(w http.ResponseWriter, token, returnTo, errMsg string) {
+	errHTML := ""
+	if errMsg != "" {
+		errHTML = `<div class="error">` + esc(errMsg) + `</div>`
+	}
+	page := `<!doctype html><html lang="en"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1"><title>Two-Factor — Access-Nex</title>` + loginStyle + `</head><body>
+<div class="card">
+  <div class="logo">🔐 Access-Nex</div><div class="sub">Two-Factor Authentication</div>` + errHTML + `
+  <h1>Enter your code</h1>
+  <p class="hint">Open your authenticator app and enter the current 6-digit code.</p>
+  <form method="POST" action="/login/2fa">
+    <input type="hidden" name="totp_token" value="` + esc(token) + `">
+    <input type="hidden" name="return_to" value="` + esc(returnTo) + `">
+    <label for="c">Code</label>
+    <input type="text" id="c" name="totp_code" inputmode="numeric" pattern="[0-9]*" maxlength="6" autocomplete="one-time-code" required autofocus>
+    <button type="submit">Verify</button>
+  </form>
+  <div class="footer"><a href="/login">← Back to sign in</a></div>
+</div></body></html>`
+	w.Header().Set("Content-Type", "text/html; charset=utf-8")
+	w.Write([]byte(page))
 }
 
 func (s *Server) renderDirectLoginPage(w http.ResponseWriter, errMsg, returnTo string) {
@@ -203,6 +268,69 @@ func (s *Server) handlePortal(w http.ResponseWriter, r *http.Request) {
 			esc(a.Name) + ` (` + esc(a.ID) + `)</option>`
 	}
 
+	// Grants: apps the user has approved, with revoke buttons.
+	grants, _ := s.store.ListGrants(subject)
+	grantRows := `<tr><td colspan="3" style="text-align:center;color:#999;padding:20px">No applications authorized yet</td></tr>`
+	if len(grants) > 0 {
+		grantRows = ""
+		for _, g := range grants {
+			appName := g.ClientID
+			if a, err := s.store.GetApp(g.ClientID); err == nil {
+				appName = a.Name
+			}
+			grantRows += `<tr><td>` + esc(appName) + `</td><td>` + esc(strings.Join(g.Scopes, ", ")) + `</td><td>
+			<form method="POST" action="/portal/grants/revoke" style="margin:0">
+			  <input type="hidden" name="client_id" value="` + esc(g.ClientID) + `">
+			  <button type="submit" class="del">Revoke</button>
+			</form></td></tr>`
+		}
+	}
+
+	// Sessions: this device's session is flagged so it isn't confused with others.
+	currentSessionID := ""
+	if cookie, err := r.Cookie(sessionCookie); err == nil {
+		currentSessionID = cookie.Value
+	}
+	sessions, _ := s.store.ListSessions(subject)
+	sessionRows := ""
+	for _, sess := range sessions {
+		label := sess.ID
+		if len(label) > 12 {
+			label = label[:12] + "…"
+		}
+		here := ""
+		if sess.ID == currentSessionID {
+			here = ` <span class="badge">this device</span>`
+		}
+		sessionRows += `<tr><td><code>` + esc(label) + `</code>` + here + `</td><td>` + sess.CreatedAt.Format("2006-01-02 15:04") + `</td><td>` + sess.ExpiresAt.Format("2006-01-02 15:04") + `</td><td>
+		<form method="POST" action="/portal/sessions/revoke" style="margin:0">
+		  <input type="hidden" name="session_id" value="` + esc(sess.ID) + `">
+		  <button type="submit" class="del">Sign Out</button>
+		</form></td></tr>`
+	}
+
+	// Linked external identities.
+	identities, _ := s.store.ListIdentities(user.ID)
+	identityRows := `<tr><td colspan="3" style="text-align:center;color:#999;padding:20px">No linked accounts</td></tr>`
+	if len(identities) > 0 {
+		identityRows = ""
+		for _, id := range identities {
+			providerName := id.ProviderID
+			if p, err := s.store.GetProvider(id.ProviderID); err == nil {
+				providerName = p.Name
+			}
+			identityRows += `<tr><td>` + esc(providerName) + `</td><td>` + esc(id.ExternalID) + `</td><td>
+			<form method="POST" action="/portal/identities/unlink" style="margin:0">
+			  <input type="hidden" name="identity_id" value="` + fmt.Sprint(id.ID) + `">
+			  <button type="submit" class="del">Unlink</button>
+			</form></td></tr>`
+		}
+	}
+	twoFAStatus := `<a href="/portal/2fa" class="btn">Set Up 2FA</a>`
+	if user.TOTPEnabled {
+		twoFAStatus = `<span class="badge">✓ Enabled</span> <a href="/portal/2fa" class="btn" style="margin-left:8px">Manage</a>`
+	}
+
 	page := `<!doctype html><html lang="en"><head><meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1"><title>Portal — Access-Nex</title>` + pageStyle + `</head><body>
 <div class="header"><h1>🔐 Access-Nex Portal</h1>
@@ -223,6 +351,32 @@ func (s *Server) handlePortal(w http.ResponseWriter, r *http.Request) {
       <div class="card"><strong>Active Sessions</strong><span>` + fmt.Sprint(activeSessions) + `</span></div>
       <div class="card"><strong>Active Tokens</strong><span>` + fmt.Sprint(activeTokens) + `</span></div>
     </div></div>
+
+  <div class="section" id="security"><h2>Security</h2>
+    <div class="grid" style="margin-bottom:20px">
+      <div class="card"><strong>Two-Factor Auth</strong><span style="font-size:14px">` + twoFAStatus + `</span></div>
+    </div>
+    <form method="POST" action="/portal/password">
+      <label for="cp">Current Password</label>
+      <input type="password" id="cp" name="current_password" autocomplete="current-password">
+      <label for="np">New Password</label>
+      <input type="password" id="np" name="new_password" autocomplete="new-password" minlength="8" required>
+      <button type="submit" class="btn">Change Password</button>
+    </form>
+  </div>
+
+  <div class="section" id="grants"><h2>Authorized Applications</h2>
+    <table><tr><th>Application</th><th>Scopes</th><th></th></tr>` + grantRows + `</table>
+  </div>
+
+  <div class="section" id="sessions"><h2>Active Sessions</h2>
+    <table><tr><th>Session</th><th>Started</th><th>Expires</th><th></th></tr>` + sessionRows + `</table>
+  </div>
+
+  <div class="section" id="identities"><h2>Linked Accounts</h2>
+    <p style="font-size:13px;color:#888;margin-bottom:14px">External sign-in providers linked to this account.</p>
+    <table><tr><th>Provider</th><th>External ID</th><th></th></tr>` + identityRows + `</table>
+  </div>
 
   <div class="section"><h2>Client OAuth Configuration</h2>
     <p style="font-size:14px;color:#666;margin-bottom:16px">
@@ -283,7 +437,15 @@ function testFlow() {
 }
 
 func (s *Server) handlePortalLogout(w http.ResponseWriter, r *http.Request) {
+	subject, hadSession := s.subjectFromSession(r)
 	s.endSession(w, r)
+	if hadSession {
+		go s.notifyBackchannelLogout(subject)
+		if uris := s.frontchannelLogoutURIs(subject); len(uris) > 0 {
+			s.renderFrontchannelLogoutPage(w, uris, "/")
+			return
+		}
+	}
 	http.Redirect(w, r, "/", http.StatusFound)
 }
 

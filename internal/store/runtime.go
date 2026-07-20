@@ -55,9 +55,9 @@ func (s *Store) ConsumeAuthCode(code string) (*models.AuthCode, error) {
 
 func (s *Store) SaveAccessToken(t *models.TokenRecord) error {
 	_, err := s.db.Exec(`
-		INSERT INTO access_tokens (token, jti, client_id, subject, scopes, audiences, expires_at, revoked)
-		VALUES (?, ?, ?, ?, ?, ?, ?, 0)`,
-		t.Token, t.JTI, t.ClientID, t.Subject, joinScopes(t.Scope), joinScopes(t.Audiences),
+		INSERT INTO access_tokens (token, jti, client_id, subject, scopes, audiences, jkt, expires_at, revoked)
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?, 0)`,
+		t.Token, t.JTI, t.ClientID, t.Subject, joinScopes(t.Scope), joinScopes(t.Audiences), t.JKT,
 		t.ExpiresAt.UTC().Format(time.RFC3339))
 	return err
 }
@@ -66,9 +66,9 @@ func (s *Store) GetAccessToken(token string) (*models.TokenRecord, error) {
 	var t models.TokenRecord
 	var scopes, audiences, expires string
 	err := s.db.QueryRow(`
-		SELECT token, jti, client_id, subject, scopes, audiences, expires_at, revoked
+		SELECT token, jti, client_id, subject, scopes, audiences, jkt, expires_at, revoked
 		FROM access_tokens WHERE token = ?`, token).
-		Scan(&t.Token, &t.JTI, &t.ClientID, &t.Subject, &scopes, &audiences, &expires, &t.Revoked)
+		Scan(&t.Token, &t.JTI, &t.ClientID, &t.Subject, &scopes, &audiences, &t.JKT, &expires, &t.Revoked)
 	if err != nil {
 		if errors.Is(err, sql.ErrNoRows) {
 			return nil, ErrNotFound
@@ -153,16 +153,21 @@ func (s *Store) RevokeToken(token, clientID string) error {
 // ── Sessions ──────────────────────────────────────────────────────────────────
 
 func (s *Store) SaveSession(sess *models.Session) error {
-	_, err := s.db.Exec(`INSERT INTO sessions (id, subject, expires_at) VALUES (?, ?, ?)`,
-		sess.ID, sess.Subject, sess.ExpiresAt.UTC().Format(time.RFC3339))
+	created := sess.CreatedAt
+	if created.IsZero() {
+		created = time.Now()
+	}
+	_, err := s.db.Exec(`
+		INSERT INTO sessions (id, subject, expires_at, created_at, user_agent) VALUES (?, ?, ?, ?, ?)`,
+		sess.ID, sess.Subject, sess.ExpiresAt.UTC().Format(time.RFC3339),
+		created.UTC().Format(time.RFC3339), sess.UserAgent)
 	return err
 }
 
-func (s *Store) GetSession(id string) (*models.Session, error) {
+func scanSession(row interface{ Scan(...any) error }) (*models.Session, error) {
 	var sess models.Session
-	var expires string
-	err := s.db.QueryRow(`SELECT id, subject, expires_at FROM sessions WHERE id = ?`, id).
-		Scan(&sess.ID, &sess.Subject, &expires)
+	var expires, created string
+	err := row.Scan(&sess.ID, &sess.Subject, &expires, &created, &sess.UserAgent)
 	if err != nil {
 		if errors.Is(err, sql.ErrNoRows) {
 			return nil, ErrNotFound
@@ -170,12 +175,55 @@ func (s *Store) GetSession(id string) (*models.Session, error) {
 		return nil, err
 	}
 	sess.ExpiresAt = parseTime(expires)
+	if created != "" {
+		sess.CreatedAt = parseTime(created)
+	}
 	return &sess, nil
+}
+
+func (s *Store) GetSession(id string) (*models.Session, error) {
+	return scanSession(s.db.QueryRow(`SELECT id, subject, expires_at, created_at, user_agent FROM sessions WHERE id = ?`, id))
+}
+
+// ListSessions returns a subject's non-expired sessions, newest first, for
+// the portal's "active sessions" self-service view.
+func (s *Store) ListSessions(subject string) ([]*models.Session, error) {
+	rows, err := s.db.Query(`
+		SELECT id, subject, expires_at, created_at, user_agent FROM sessions
+		WHERE subject = ? AND expires_at > ? ORDER BY created_at DESC`,
+		subject, time.Now().UTC().Format(time.RFC3339))
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var out []*models.Session
+	for rows.Next() {
+		sess, err := scanSession(rows)
+		if err != nil {
+			return nil, err
+		}
+		out = append(out, sess)
+	}
+	return out, rows.Err()
 }
 
 func (s *Store) DeleteSession(id string) error {
 	_, err := s.db.Exec(`DELETE FROM sessions WHERE id = ?`, id)
 	return err
+}
+
+// DeleteSessionForSubject revokes one session, but only if it belongs to
+// subject — used by the self-service portal so a user can only end their own
+// sessions.
+func (s *Store) DeleteSessionForSubject(subject, id string) error {
+	res, err := s.db.Exec(`DELETE FROM sessions WHERE id = ? AND subject = ?`, id, subject)
+	if err != nil {
+		return err
+	}
+	if n, _ := res.RowsAffected(); n == 0 {
+		return ErrNotFound
+	}
+	return nil
 }
 
 // ── Stats and housekeeping ────────────────────────────────────────────────────
@@ -199,6 +247,7 @@ func (s *Store) CleanupExpired() error {
 		`DELETE FROM access_tokens WHERE expires_at <= ?`,
 		`DELETE FROM refresh_tokens WHERE expires_at <= ?`,
 		`DELETE FROM sessions WHERE expires_at <= ?`,
+		`DELETE FROM device_codes WHERE expires_at <= ?`,
 	} {
 		if _, err := s.db.Exec(q, nowStr); err != nil {
 			return err
