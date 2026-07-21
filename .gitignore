@@ -27,6 +27,9 @@
 # Fortran module files
 *.mod
 *.smod
+# ...but not Go's go.mod, which *.mod above was accidentally also matching —
+# go.mod must be tracked for `go build`/`go mod download` to work at all.
+!go.mod
 
 # Compiled Static libraries
 *.lai
