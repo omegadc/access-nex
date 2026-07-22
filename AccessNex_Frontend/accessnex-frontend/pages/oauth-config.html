@@ -1,0 +1,184 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>AccessNex — OAuth config</title>
+  <link rel="preconnect" href="https://fonts.googleapis.com" />
+  <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600&display=swap" rel="stylesheet" />
+  <link rel="stylesheet" href="../css/styles.css" />
+  <style>
+    .config-table td:first-child { color: var(--text-muted); font-size: 12px; width: 200px; }
+    .copy-btn { background: transparent; border: 0.5px solid var(--border); color: var(--text-muted); padding: 2px 8px; border-radius: 4px; font-size: 11px; cursor: pointer; font-family: var(--font); }
+    .copy-btn:hover { border-color: var(--accent); color: var(--accent); }
+    .endpoint-row { display: flex; align-items: center; gap: 8px; padding: 8px 0; border-bottom: 0.5px solid var(--border-light); }
+    .endpoint-row:last-child { border-bottom: none; }
+    .method-badge { font-size: 10px; font-weight: 600; padding: 2px 7px; border-radius: 4px; background: var(--accent-dim); color: var(--accent); font-family: var(--font-mono); flex-shrink: 0; }
+    .endpoint-path { font-family: var(--font-mono); font-size: 12px; color: var(--text-secondary); flex: 1; }
+    .endpoint-desc { font-size: 12px; color: var(--text-muted); }
+  </style>
+</head>
+<body>
+  <div class="main-wrap">
+    <div class="page-header">
+      <h1 class="page-title">OAuth config</h1>
+      <p class="page-sub">Generate OAuth settings for client applications and explore available endpoints</p>
+    </div>
+
+    <!-- App selector -->
+    <div class="card" style="margin-bottom:1.25rem">
+      <div class="card-header">
+        <span class="card-title">
+          <svg viewBox="0 0 24 24"><rect x="2" y="2" width="9" height="9"/><rect x="13" y="2" width="9" height="9"/><rect x="2" y="13" width="9" height="9"/><rect x="13" y="13" width="9" height="9"/></svg>
+          Client OAuth configuration
+        </span>
+      </div>
+      <div class="card-body">
+        <p style="font-size:13px;color:var(--text-secondary);margin-bottom:1rem">Select a registered application to generate the OAuth settings to paste into a client (e.g. Portainer → Settings → Authentication → OAuth).</p>
+        <div class="field">
+          <label>Select application</label>
+          <select id="appSel" onchange="fillConfig()">
+            <option value="">— select an app —</option>
+          </select>
+        </div>
+
+        <div id="configPanel" style="display:none; margin-top:1rem">
+          <table class="config-table" style="margin-bottom:1rem">
+            <thead><tr><th>Setting</th><th>Value</th><th></th></tr></thead>
+            <tbody>
+              <tr><td>Provider</td><td><div class="code-block">Custom (AccessNex)</div></td><td></td></tr>
+              <tr><td>Client ID</td><td><div class="code-block" id="cfgClientId">—</div></td><td><button class="copy-btn" onclick="copyEl('cfgClientId')">Copy</button></td></tr>
+              <tr><td>Client Secret</td><td><div class="code-block" id="cfgSecret">—</div></td><td><button class="copy-btn" onclick="copyEl('cfgSecret')">Copy</button></td></tr>
+              <tr><td>Authorization URL</td><td><div class="code-block" id="cfgAuth">—</div></td><td><button class="copy-btn" onclick="copyEl('cfgAuth')">Copy</button></td></tr>
+              <tr><td>Access Token URL</td><td><div class="code-block" id="cfgToken">—</div></td><td><button class="copy-btn" onclick="copyEl('cfgToken')">Copy</button></td></tr>
+              <tr><td>Resource URL (userinfo)</td><td><div class="code-block" id="cfgUserinfo">—</div></td><td><button class="copy-btn" onclick="copyEl('cfgUserinfo')">Copy</button></td></tr>
+              <tr><td>Logout URL</td><td><div class="code-block" id="cfgLogout">—</div></td><td><button class="copy-btn" onclick="copyEl('cfgLogout')">Copy</button></td></tr>
+              <tr><td>Redirect URL</td><td><div class="code-block" id="cfgRedirect">—</div></td><td><button class="copy-btn" onclick="copyEl('cfgRedirect')">Copy</button></td></tr>
+              <tr><td>User identifier</td><td><div class="code-block">email</div></td><td></td></tr>
+              <tr><td>Scopes</td><td><div class="code-block">openid profile email</div></td><td><button class="copy-btn" onclick="navigator.clipboard.writeText('openid profile email')">Copy</button></td></tr>
+              <tr><td>Token auth method</td><td><div class="code-block">client_secret_post</div></td><td></td></tr>
+            </tbody>
+          </table>
+
+          <div style="display:flex;align-items:center;gap:12px;flex-wrap:wrap">
+            <button class="btn btn-accent-dim" onclick="testFlow()">Run OAuth flow test</button>
+            <span id="flowResult" style="font-size:13px;color:var(--text-muted)"></span>
+          </div>
+        </div>
+      </div>
+    </div>
+
+    <!-- OIDC endpoints -->
+    <div class="card" style="margin-bottom:1.25rem">
+      <div class="card-header">
+        <span class="card-title">
+          <svg viewBox="0 0 24 24"><circle cx="12" cy="12" r="10"/><path d="M8.56 2.75c4.37 6.03 6.02 9.42 8.03 17.72m2.54-15.38c-3.72 4.35-8.94 5.66-16.88 5.85m19.5 1.9c-3.5-.93-6.63-.82-8.94 0-2.58.92-5.01 2.86-7.44 6.32"/></svg>
+          OIDC / OAuth2 endpoints
+        </span>
+        <a id="discoveryLink" href="#" target="_blank" class="btn btn-ghost btn-sm">View discovery doc</a>
+      </div>
+      <div class="card-body" id="endpointList">
+        <div class="endpoint-row"><span class="method-badge">GET</span><span class="endpoint-path">/.well-known/openid-configuration</span><span class="endpoint-desc">Discovery document</span></div>
+        <div class="endpoint-row"><span class="method-badge">GET/POST</span><span class="endpoint-path">/authorize</span><span class="endpoint-desc">Authorization endpoint</span></div>
+        <div class="endpoint-row"><span class="method-badge">POST</span><span class="endpoint-path">/token</span><span class="endpoint-desc">Token exchange</span></div>
+        <div class="endpoint-row"><span class="method-badge">GET</span><span class="endpoint-path">/userinfo</span><span class="endpoint-desc">User claims (OIDC)</span></div>
+        <div class="endpoint-row"><span class="method-badge">GET</span><span class="endpoint-path">/jwks</span><span class="endpoint-desc">Public key set (JWT verification)</span></div>
+        <div class="endpoint-row"><span class="method-badge">POST</span><span class="endpoint-path">/revoke</span><span class="endpoint-desc">Token revocation</span></div>
+        <div class="endpoint-row"><span class="method-badge">POST</span><span class="endpoint-path">/introspect</span><span class="endpoint-desc">Token introspection</span></div>
+        <div class="endpoint-row"><span class="method-badge">POST</span><span class="endpoint-path">/register</span><span class="endpoint-desc">Dynamic client registration</span></div>
+        <div class="endpoint-row"><span class="method-badge">GET/POST</span><span class="endpoint-path">/end_session</span><span class="endpoint-desc">Logout / session termination</span></div>
+      </div>
+    </div>
+
+    <!-- OAuth proxy endpoints -->
+    <div class="card">
+      <div class="card-header">
+        <span class="card-title">
+          <svg viewBox="0 0 24 24"><path d="M18 20V10"/><path d="M12 20V4"/><path d="M6 20v-6"/></svg>
+          OAuth proxy (external providers)
+        </span>
+      </div>
+      <div class="card-body">
+        <div class="endpoint-row"><span class="method-badge">GET</span><span class="endpoint-path">/oauth/providers</span><span class="endpoint-desc">List enabled external providers</span></div>
+        <div class="endpoint-row"><span class="method-badge">GET</span><span class="endpoint-path">/oauth/start?provider_id=X&client_id=Y&redirect_uri=Z</span><span class="endpoint-desc">Begin SSO via external provider</span></div>
+        <div class="endpoint-row"><span class="method-badge">GET</span><span class="endpoint-path">/oauth/callback</span><span class="endpoint-desc">Receive code → issue local auth code</span></div>
+      </div>
+    </div>
+  </div>
+
+  <script src="../js/api.js"></script>
+  <script src="../js/nav.js"></script>
+  <script>
+    requireAuth();
+    injectNav("oauth");
+
+    let discoveryData = null;
+    let appsData = [];
+
+    async function loadPage() {
+      /* Load discovery doc to get real endpoint URLs */
+      try {
+        discoveryData = await OAuthAPI.discovery();
+        document.getElementById("discoveryLink").href = `${API_BASE}/.well-known/openid-configuration`;
+      } catch { /* use defaults */ }
+
+      /* Load apps for selector */
+      try {
+        appsData = await AppsAPI.list();
+        const sel = document.getElementById("appSel");
+        appsData.forEach(a => {
+          const opt = document.createElement("option");
+          opt.value = a.id || a.client_id || a.name;
+          opt.textContent = `${a.name} (${a.id || a.client_id})`;
+          opt.dataset.secret   = a.secret || a.client_secret || "";
+          opt.dataset.public   = a.public ? "true" : "false";
+          opt.dataset.uris     = (a.redirect_uris || a.redirect_uri || []).join(",");
+          sel.appendChild(opt);
+        });
+      } catch (err) {
+        console.warn("Could not load apps:", err.message);
+      }
+    }
+
+    function fillConfig() {
+      const sel = document.getElementById("appSel");
+      const opt = sel.options[sel.selectedIndex];
+      if (!opt.value) { document.getElementById("configPanel").style.display = "none"; return; }
+
+      const issuer = (discoveryData && discoveryData.issuer) || API_BASE;
+
+      document.getElementById("cfgClientId").textContent  = opt.value;
+      document.getElementById("cfgSecret").textContent    = opt.dataset.public === "true" ? "(public client — no secret)" : (opt.dataset.secret || "••••••••");
+      document.getElementById("cfgAuth").textContent      = (discoveryData && discoveryData.authorization_endpoint) || `${issuer}/authorize`;
+      document.getElementById("cfgToken").textContent     = (discoveryData && discoveryData.token_endpoint)         || `${issuer}/token`;
+      document.getElementById("cfgUserinfo").textContent  = (discoveryData && discoveryData.userinfo_endpoint)      || `${issuer}/userinfo`;
+      document.getElementById("cfgLogout").textContent    = (discoveryData && discoveryData.end_session_endpoint)   || `${issuer}/end_session`;
+
+      const uris = (opt.dataset.uris || "").split(",").filter(Boolean);
+      document.getElementById("cfgRedirect").textContent  = uris[0] || "(no redirect URI registered)";
+
+      document.getElementById("configPanel").style.display = "block";
+    }
+
+    function copyEl(id) {
+      const text = document.getElementById(id).textContent.trim();
+      navigator.clipboard.writeText(text).then(() => showToast("Copied to clipboard"));
+    }
+
+    function testFlow() {
+      const sel = document.getElementById("appSel");
+      const opt = sel.options[sel.selectedIndex];
+      if (!opt.value) { alert("Select an application first"); return; }
+      const uris = (opt.dataset.uris || "").split(",").filter(Boolean);
+      if (!uris[0]) { alert("No redirect URI registered for this app"); return; }
+      const issuer = (discoveryData && discoveryData.issuer) || API_BASE;
+      const state  = Math.random().toString(36).slice(2);
+      const url    = `${issuer}/authorize?response_type=code&client_id=${encodeURIComponent(opt.value)}&redirect_uri=${encodeURIComponent(uris[0])}&scope=openid+profile+email&state=${state}`;
+      document.getElementById("flowResult").textContent = "Opening OAuth flow in new tab…";
+      window.open(url, "_blank");
+    }
+
+    loadPage();
+  </script>
+</body>
+</html>

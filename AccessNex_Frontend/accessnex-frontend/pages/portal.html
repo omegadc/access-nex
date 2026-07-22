@@ -1,0 +1,268 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>AccessNex — My account</title>
+  <link rel="preconnect" href="https://fonts.googleapis.com" />
+  <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600&display=swap" rel="stylesheet" />
+  <link rel="stylesheet" href="../css/styles.css" />
+  <style>
+    .section-gap { margin-bottom: 1.25rem; }
+    .pw-form { display: flex; gap: 10px; align-items: flex-end; flex-wrap: wrap; }
+    .pw-form .field { flex: 1; min-width: 150px; margin-bottom: 0; }
+    .totp-badge { display: inline-flex; align-items: center; gap: 6px; }
+  </style>
+</head>
+<body>
+  <div class="main-wrap">
+    <div class="page-header">
+      <h1 class="page-title">My account</h1>
+      <p class="page-sub">Your profile, sessions, and authorized applications</p>
+    </div>
+
+    <!-- Profile -->
+    <div class="card section-gap">
+      <div class="card-header">
+        <span class="card-title">
+          <svg viewBox="0 0 24 24"><path d="M20 21v-2a4 4 0 0 0-4-4H8a4 4 0 0 0-4 4v2"/><circle cx="12" cy="7" r="4"/></svg>
+          Signed-in user
+        </span>
+        <span class="badge badge-teal">Validated</span>
+      </div>
+      <div class="card-body">
+        <div class="info-grid" id="profileGrid">
+          <div class="info-item"><div class="info-label">Display name</div><div class="info-value" id="pName">—</div></div>
+          <div class="info-item"><div class="info-label">Username</div><div class="info-value" id="pUsername">—</div></div>
+          <div class="info-item"><div class="info-label">Email</div><div class="info-value" id="pEmail">—</div></div>
+          <div class="info-item"><div class="info-label">Subject</div><div class="info-value" id="pSubject" style="font-family:var(--font-mono);font-size:11px">—</div></div>
+        </div>
+      </div>
+    </div>
+
+    <!-- Live stats -->
+    <div class="stats-grid" style="margin-bottom:1.25rem">
+      <div class="stat-card">
+        <div class="stat-label"><svg viewBox="0 0 24 24"><path d="M17 21v-2a4 4 0 0 0-4-4H5a4 4 0 0 0-4 4v2"/><circle cx="9" cy="7" r="4"/></svg>Active sessions</div>
+        <div class="stat-value" id="statSessions">—</div>
+        <div class="stat-sub">Across all devices</div>
+      </div>
+      <div class="stat-card">
+        <div class="stat-label"><svg viewBox="0 0 24 24"><rect x="3" y="11" width="18" height="11" rx="2"/><path d="M7 11V7a5 5 0 0 1 10 0v4"/></svg>Active tokens</div>
+        <div class="stat-value" id="statTokens">—</div>
+        <div class="stat-sub">Issued access tokens</div>
+      </div>
+    </div>
+
+    <!-- Security / password -->
+    <div class="card section-gap">
+      <div class="card-header">
+        <span class="card-title">
+          <svg viewBox="0 0 24 24"><rect x="3" y="11" width="18" height="11" rx="2"/><path d="M7 11V7a5 5 0 0 1 10 0v4"/></svg>
+          Security
+        </span>
+        <div class="totp-badge">
+          <span id="totpBadge" class="badge badge-amber">2FA not set up</span>
+          <a href="#" class="btn btn-ghost btn-sm" id="totpLink">Set up 2FA</a>
+        </div>
+      </div>
+      <div class="card-body">
+        <p style="font-size:12px;color:var(--text-muted);margin-bottom:1rem">Change your password</p>
+        <div class="pw-form">
+          <div class="field"><label>Current password</label><input type="password" id="pwCurrent" placeholder="••••••••" autocomplete="current-password" /></div>
+          <div class="field"><label>New password</label><input type="password" id="pwNew" placeholder="••••••••" autocomplete="new-password" minlength="8" /></div>
+          <button class="btn btn-accent-dim" onclick="changePassword()" style="margin-bottom:0">Update password</button>
+        </div>
+        <p class="error-msg" id="pwErr"></p>
+      </div>
+    </div>
+
+    <!-- Authorized apps (grants) -->
+    <div class="card section-gap">
+      <div class="card-header">
+        <span class="card-title">
+          <svg viewBox="0 0 24 24"><rect x="2" y="2" width="9" height="9"/><rect x="13" y="2" width="9" height="9"/><rect x="2" y="13" width="9" height="9"/><rect x="13" y="13" width="9" height="9"/></svg>
+          Authorized applications
+        </span>
+      </div>
+      <table>
+        <thead><tr><th>Application</th><th>Scopes</th><th></th></tr></thead>
+        <tbody id="grantsBody"><tr><td colspan="3" class="loading">Loading...</td></tr></tbody>
+      </table>
+    </div>
+
+    <!-- Active sessions -->
+    <div class="card section-gap">
+      <div class="card-header">
+        <span class="card-title">
+          <svg viewBox="0 0 24 24"><rect x="2" y="3" width="20" height="14" rx="2"/><line x1="8" y1="21" x2="16" y2="21"/><line x1="12" y1="17" x2="12" y2="21"/></svg>
+          Active sessions
+        </span>
+      </div>
+      <table>
+        <thead><tr><th>Session</th><th>Started</th><th>Expires</th><th></th></tr></thead>
+        <tbody id="sessionsBody"><tr><td colspan="4" class="loading">Loading...</td></tr></tbody>
+      </table>
+    </div>
+
+    <!-- Linked external identities -->
+    <div class="card">
+      <div class="card-header">
+        <span class="card-title">
+          <svg viewBox="0 0 24 24"><path d="M10 13a5 5 0 0 0 7.54.54l3-3a5 5 0 0 0-7.07-7.07l-1.72 1.71"/><path d="M14 11a5 5 0 0 0-7.54-.54l-3 3a5 5 0 0 0 7.07 7.07l1.71-1.71"/></svg>
+          Linked accounts
+        </span>
+      </div>
+      <p style="font-size:12px;color:var(--text-muted);padding:0.6rem 1.1rem 0">External sign-in providers linked to this account.</p>
+      <table>
+        <thead><tr><th>Provider</th><th>External ID</th><th></th></tr></thead>
+        <tbody id="identitiesBody"><tr><td colspan="3" class="loading">Loading...</td></tr></tbody>
+      </table>
+    </div>
+  </div>
+
+  <script src="../js/api.js"></script>
+  <script src="../js/nav.js"></script>
+  <script>
+    requireAuth();
+    injectNav("portal");
+
+    async function loadPortal() {
+      try {
+        const profile = await PortalAPI.profile();
+        document.getElementById("pName").textContent     = profile.name     || "—";
+        document.getElementById("pUsername").textContent = profile.preferred_username || profile.sub || "—";
+        document.getElementById("pEmail").textContent    = profile.email    || "—";
+        document.getElementById("pSubject").textContent  = profile.sub      || "—";
+      } catch (e) {
+        /* If /userinfo fails, fall back to JWT payload */
+        const user = Auth.getUser();
+        if (user) {
+          document.getElementById("pUsername").textContent = user.username;
+        }
+      }
+
+      /* Stats */
+      try {
+        const stats = await PortalAPI.stats();
+        document.getElementById("statSessions").textContent = stats.active_sessions ?? "—";
+        document.getElementById("statTokens").textContent   = stats.active_tokens   ?? "—";
+      } catch { /* leave as — */ }
+
+      /* Grants */
+      loadGrants();
+      loadSessions();
+      loadIdentities();
+    }
+
+    async function loadGrants() {
+      const tbody = document.getElementById("grantsBody");
+      try {
+        const grants = await PortalAPI.listGrants();
+        if (!grants || !grants.length) {
+          tbody.innerHTML = `<tr><td colspan="3" style="color:var(--text-muted);padding:1rem;text-align:center">No applications authorized yet</td></tr>`;
+          return;
+        }
+        tbody.innerHTML = grants.map(g => `
+          <tr>
+            <td class="td-name">${g.client_name || g.client_id}</td>
+            <td style="font-size:12px">${(g.scopes || []).join(", ")}</td>
+            <td><button class="btn btn-danger btn-sm" onclick="revokeGrant('${g.client_id}')">Revoke</button></td>
+          </tr>
+        `).join("");
+      } catch (err) {
+        tbody.innerHTML = `<tr><td colspan="3" class="error-msg" style="padding:1rem">${err.message}</td></tr>`;
+      }
+    }
+
+    async function revokeGrant(clientId) {
+      if (!confirm("Revoke access for this application?")) return;
+      try {
+        await PortalAPI.revokeGrant(clientId);
+        showToast("Access revoked");
+        loadGrants();
+      } catch (err) { showToast("Failed: " + err.message); }
+    }
+
+    async function loadSessions() {
+      const tbody = document.getElementById("sessionsBody");
+      try {
+        const sessions = await PortalAPI.listSessions();
+        if (!sessions || !sessions.length) {
+          tbody.innerHTML = `<tr><td colspan="4" style="color:var(--text-muted);padding:1rem;text-align:center">No active sessions</td></tr>`;
+          return;
+        }
+        tbody.innerHTML = sessions.map(s => {
+          const label = s.id ? s.id.slice(0, 12) + "…" : "—";
+          const here  = s.current ? ` <span class="badge badge-teal">this device</span>` : "";
+          const start = s.created_at ? new Date(s.created_at).toLocaleString() : "—";
+          const exp   = s.expires_at ? new Date(s.expires_at).toLocaleString() : "—";
+          return `<tr>
+            <td class="td-mono">${label}${here}</td>
+            <td style="font-size:12px">${start}</td>
+            <td style="font-size:12px">${exp}</td>
+            <td><button class="btn btn-danger btn-sm" onclick="revokeSession('${s.id}')">Sign out</button></td>
+          </tr>`;
+        }).join("");
+      } catch (err) {
+        tbody.innerHTML = `<tr><td colspan="4" class="error-msg" style="padding:1rem">${err.message}</td></tr>`;
+      }
+    }
+
+    async function revokeSession(sessionId) {
+      if (!confirm("Sign out of this session?")) return;
+      try {
+        await PortalAPI.revokeSession(sessionId);
+        showToast("Session ended");
+        loadSessions();
+      } catch (err) { showToast("Failed: " + err.message); }
+    }
+
+    async function loadIdentities() {
+      const tbody = document.getElementById("identitiesBody");
+      try {
+        const ids = await PortalAPI.listIdentities();
+        if (!ids || !ids.length) {
+          tbody.innerHTML = `<tr><td colspan="3" style="color:var(--text-muted);padding:1rem;text-align:center">No linked accounts</td></tr>`;
+          return;
+        }
+        tbody.innerHTML = ids.map(i => `
+          <tr>
+            <td class="td-name">${i.provider_name || i.provider_id}</td>
+            <td class="td-mono">${i.external_id}</td>
+            <td><button class="btn btn-danger btn-sm" onclick="unlinkIdentity(${i.id})">Unlink</button></td>
+          </tr>
+        `).join("");
+      } catch (err) {
+        tbody.innerHTML = `<tr><td colspan="3" class="error-msg" style="padding:1rem">${err.message}</td></tr>`;
+      }
+    }
+
+    async function unlinkIdentity(id) {
+      if (!confirm("Unlink this external account?")) return;
+      try {
+        await PortalAPI.unlinkIdentity(id);
+        showToast("Account unlinked");
+        loadIdentities();
+      } catch (err) { showToast("Failed: " + err.message); }
+    }
+
+    async function changePassword() {
+      const cur  = document.getElementById("pwCurrent").value;
+      const nw   = document.getElementById("pwNew").value;
+      const errEl = document.getElementById("pwErr");
+      errEl.textContent = "";
+      if (!cur || !nw) { errEl.textContent = "Please fill in both fields."; return; }
+      if (nw.length < 8) { errEl.textContent = "New password must be at least 8 characters."; return; }
+      try {
+        await PortalAPI.changePassword(cur, nw);
+        showToast("Password updated");
+        document.getElementById("pwCurrent").value = "";
+        document.getElementById("pwNew").value = "";
+      } catch (err) { errEl.textContent = err.message; }
+    }
+
+    loadPortal();
+  </script>
+</body>
+</html>
