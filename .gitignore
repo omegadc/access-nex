@@ -79,3 +79,6 @@ __pycache__/
 *.pyc
 .venv/
 venv/
+
+# local secrets for docker compose
+.env
