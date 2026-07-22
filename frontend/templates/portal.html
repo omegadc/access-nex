@@ -1,0 +1,160 @@
+{% extends "base_app.html" %}
+{% block content %}
+<div class="page-header">
+  <div class="page-title">Access-Nex Portal</div>
+  <div class="page-sub">Your account, security, and authorized applications</div>
+</div>
+
+{% if ok == 'password' %}<div class="alert alert-success">Password updated.</div>{% endif %}
+{% if ok == 'verification_sent' %}<div class="alert alert-success">Verification email sent.</div>{% endif %}
+{% if error == 'wrong_password' %}<div class="alert alert-error">Current password is incorrect.</div>{% endif %}
+{% if error == 'weak_password' %}<div class="alert alert-error">New password must be at least 8 characters.</div>{% endif %}
+{% if error == 'last_identity' %}<div class="alert alert-error">Can't unlink your only sign-in method.</div>{% endif %}
+
+{% if user.email and not user.email_verified %}
+<div class="card" style="background:rgba(251,191,36,.06);border-color:rgba(251,191,36,.3)">
+  <div class="card-body">
+    📧 Your email address isn't verified yet.
+    <form method="post" action="/portal/verify-email/resend" class="inline-form">
+      <button type="submit" class="btn btn-sm" style="margin-left:8px">Resend verification email</button>
+    </form>
+  </div>
+</div>
+{% endif %}
+
+<div class="card" id="profile">
+  <div class="card-header"><span class="card-title">Signed-In User</span><span class="badge badge-green">✓ Validated</span></div>
+  <div class="card-body">
+    <div class="info-grid">
+      <div class="info-item"><div class="info-label">Display Name</div><div class="info-value">{{ user.name or "—" }}</div></div>
+      <div class="info-item"><div class="info-label">Username</div><div class="info-value">{{ user.username }}</div></div>
+      <div class="info-item"><div class="info-label">Email</div><div class="info-value">{{ user.email or "—" }}{% if user.email and not user.email_verified %} <span class="badge badge-amber">unverified</span>{% endif %}</div></div>
+      <div class="info-item"><div class="info-label">Subject</div><div class="info-value" style="font-family:var(--font-mono);font-size:11px">{{ user.subject }}</div></div>
+    </div>
+  </div>
+</div>
+
+<div class="stats-grid">
+  <div class="stat-card"><div class="stat-label">Active Sessions</div><div class="stat-value">{{ active_stats.active_sessions }}</div></div>
+  <div class="stat-card"><div class="stat-label">Active Tokens</div><div class="stat-value">{{ active_stats.active_tokens }}</div></div>
+</div>
+
+<div class="card" id="security">
+  <div class="card-header">
+    <span class="card-title">Security</span>
+    {% if totp.enabled %}<span class="badge badge-green">✓ 2FA Enabled</span>{% else %}<span class="badge badge-amber">2FA not set up</span>{% endif %}
+  </div>
+  <div class="card-body">
+    <p style="margin-bottom:14px"><a href="/portal/2fa" class="btn btn-sm">Manage Two-Factor Authentication</a></p>
+    <form method="post" action="/portal/password">
+      <div class="field"><label for="cp">Current Password</label><input type="password" id="cp" name="current_password" autocomplete="current-password"></div>
+      <div class="field"><label for="np">New Password</label><input type="password" id="np" name="new_password" autocomplete="new-password" minlength="8" required></div>
+      <button type="submit" class="btn btn-primary">Change Password</button>
+    </form>
+  </div>
+</div>
+
+<div class="card" id="grants">
+  <div class="card-header"><span class="card-title">Authorized Applications</span></div>
+  <table>
+    <thead><tr><th>Application</th><th>Scopes</th><th></th></tr></thead>
+    <tbody>
+      {% for g in grants %}
+      <tr>
+        <td class="td-name">{{ g.app_name }}</td>
+        <td>{{ g.scopes|join(", ") }}</td>
+        <td><form method="post" action="/portal/grants/revoke" class="inline-form">
+          <input type="hidden" name="client_id" value="{{ g.client_id }}">
+          <button type="submit" class="btn btn-danger btn-sm">Revoke</button>
+        </form></td>
+      </tr>
+      {% else %}
+      <tr class="empty-row"><td colspan="3">No applications authorized yet</td></tr>
+      {% endfor %}
+    </tbody>
+  </table>
+</div>
+
+<div class="card" id="sessions">
+  <div class="card-header"><span class="card-title">Active Sessions</span></div>
+  <table>
+    <thead><tr><th>Session</th><th>Started</th><th>Expires</th><th></th></tr></thead>
+    <tbody>
+      {% for s in sessions %}
+      <tr>
+        <td class="td-mono">{{ s.id[:12] }}…{% if s.current %} <span class="badge badge-green">this device</span>{% endif %}</td>
+        <td>{{ s.created_at }}</td>
+        <td>{{ s.expires_at }}</td>
+        <td><form method="post" action="/portal/sessions/revoke" class="inline-form">
+          <input type="hidden" name="session_id" value="{{ s.id }}">
+          <button type="submit" class="btn btn-danger btn-sm">Sign Out</button>
+        </form></td>
+      </tr>
+      {% else %}
+      <tr class="empty-row"><td colspan="4">No active sessions</td></tr>
+      {% endfor %}
+    </tbody>
+  </table>
+</div>
+
+<div class="card" id="identities">
+  <div class="card-header"><span class="card-title">Linked Accounts</span></div>
+  <div class="card-body" style="padding-bottom:0"><p style="font-size:12px;color:var(--text-secondary)">External sign-in providers linked to this account.</p></div>
+  <table>
+    <thead><tr><th>Provider</th><th>External ID</th><th></th></tr></thead>
+    <tbody>
+      {% for i in identities %}
+      <tr>
+        <td class="td-name">{{ i.provider_name }}</td>
+        <td class="td-mono">{{ i.external_id }}</td>
+        <td><form method="post" action="/portal/identities/unlink" class="inline-form">
+          <input type="hidden" name="identity_id" value="{{ i.id }}">
+          <button type="submit" class="btn btn-danger btn-sm">Unlink</button>
+        </form></td>
+      </tr>
+      {% else %}
+      <tr class="empty-row"><td colspan="3">No linked accounts</td></tr>
+      {% endfor %}
+    </tbody>
+  </table>
+</div>
+
+<div class="card">
+  <div class="card-header"><span class="card-title">Client OAuth Configuration</span></div>
+  <div class="card-body">
+    <p style="font-size:13px;color:var(--text-secondary);margin-bottom:14px">
+      Select a registered application to generate the OAuth settings to paste into a client
+      (e.g. Portainer → Settings → Authentication → OAuth).
+    </p>
+    <div class="field">
+      <select id="appSel" onchange="fillConfig()">
+        <option value="">— select an app —</option>
+        {% for a in app_configs %}
+        <option value="{{ a.id }}" data-secret="{{ a.secret or '' }}" data-uris="{{ a.redirect_uris|join(',') }}">{{ a.name }} ({{ a.id }})</option>
+        {% endfor %}
+      </select>
+    </div>
+    <div id="cfg" style="display:none">
+      <table>
+        <tr><th>Setting</th><th>Value</th></tr>
+        <tr><td>Provider</td><td><code>Custom</code></td></tr>
+        <tr><td>Client ID</td><td><code id="c-cid"></code></td></tr>
+        <tr><td>Client Secret</td><td><code id="c-sec"></code></td></tr>
+        <tr><td>Authorization URL</td><td><code>{{ issuer }}/authorize</code></td></tr>
+        <tr><td>Access Token URL</td><td><code>{{ issuer }}/token</code></td></tr>
+        <tr><td>Resource URL</td><td><code>{{ issuer }}/userinfo</code></td></tr>
+        <tr><td>Logout URL</td><td><code>{{ issuer }}/end_session</code></td></tr>
+        <tr><td>Redirect URL</td><td><code id="c-redir"></code></td></tr>
+        <tr><td>User Identifier</td><td><code>email</code></td></tr>
+        <tr><td>Scopes</td><td><code>openid profile email</code></td></tr>
+        <tr><td>Token Auth Method</td><td><code>client_secret_post</code></td></tr>
+      </table>
+      <div style="margin-top:16px">
+        <button class="btn" onclick="testFlow()">▶ Run OAuth Flow Test</button>
+        <span id="flowResult" style="margin-left:12px;font-size:13px;color:var(--text-secondary)"></span>
+      </div>
+    </div>
+  </div>
+</div>
+{% endblock %}
+{% block extra_scripts %}<script src="/static/js/portal.js"></script>{% endblock %}

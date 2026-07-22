@@ -1,9 +1,15 @@
 # Access-Nex + PostgreSQL. `docker compose up -d`, then run the CLI commands
 # below (once) to create your first admin user and application.
 #
-# On the same Docker network, Portainer (or any other container) reaches
-# this service at http://access-nex:8080 — no host.docker.internal needed,
-# since both containers share the compose network.
+# Three services: PostgreSQL, the Go backend (access-nex — OIDC/OAuth2
+# protocol + JSON APIs, see docs/FRONTEND.md), and the Python/FastAPI
+# frontend (every browser-facing page). Only the frontend publishes a host
+# port — it's the single origin browsers talk to, proxying anything that
+# isn't one of its own pages straight through to the backend over the
+# compose network (http://access-nex:8080, no host.docker.internal needed
+# since both containers share the network). This is the "same-origin via
+# reverse proxy" topology docs/FRONTEND.md recommends, just built in instead
+# of requiring a separate nginx/Caddy/Traefik.
 #
 # First-time setup:
 #   docker compose up -d
@@ -12,6 +18,9 @@
 #
 # access-nex auto-initializes the local OIDC provider on first `server`
 # start (using --issuer below), so no separate init step is needed for that.
+# --issuer stays http://localhost:8080 (not the internal access-nex:8080)
+# because that's the URL browsers and OAuth clients actually reach — it
+# lands on the frontend, which proxies the OIDC/OAuth2 paths through.
 #
 # Why PostgreSQL (not the default SQLite) for the Docker deployment: with
 # SQLite, `docker exec ... access-nex ...` admin commands run against the
@@ -45,8 +54,9 @@ services:
     depends_on:
       db:
         condition: service_healthy
-    ports:
-      - "8080:8080"
+    # No host port published: this is the backend now, reached only by the
+    # frontend service (and `docker compose exec` for CLI commands) over the
+    # compose network.
     volumes:
       # AES box key + signing key persist here regardless of --db.
       - accessnex-config:/data
@@ -58,6 +68,18 @@ services:
       - --db=postgres://accessnex:${POSTGRES_PASSWORD:?}@db:5432/accessnex?sslmode=disable
       - --addr=:8080
       - --issuer=http://localhost:8080
+
+  frontend:
+    build:
+      context: .
+      dockerfile: frontend/Dockerfile
+    restart: unless-stopped
+    depends_on:
+      - access-nex
+    ports:
+      - "8080:8000"
+    environment:
+      ACCESS_NEX_BACKEND_URL: http://access-nex:8080
 
 volumes:
   accessnex-db:

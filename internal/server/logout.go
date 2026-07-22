@@ -15,7 +15,6 @@ package server
 import (
 	"net/http"
 	"net/url"
-	"strings"
 	"time"
 
 	"github.com/omegadc/access-nex/internal/models"
@@ -75,28 +74,17 @@ func (s *Server) frontchannelLogoutURIs(subject string) []string {
 	return uris
 }
 
-// renderFrontchannelLogoutPage shows a brief confirmation while each app's
-// front-channel logout URI loads in a hidden iframe, then continues to
-// redirectTo (or a default message page if empty).
-func (s *Server) renderFrontchannelLogoutPage(w http.ResponseWriter, uris []string, redirectTo string) {
-	iframes := ""
+// redirectToLogoutPage sends the browser to the frontend's logout page,
+// which loads each app's front-channel logout URI in a hidden iframe (so it
+// runs in the user's own browser session with that app) before continuing
+// to redirectTo.
+func (s *Server) redirectToLogoutPage(w http.ResponseWriter, r *http.Request, uris []string, redirectTo string) {
+	v := url.Values{}
 	for _, u := range uris {
-		iframes += `<iframe src="` + esc(u) + `" style="display:none" width="0" height="0"></iframe>`
+		v.Add("uri", u)
 	}
-	continueScript := `<p>Signed out. <a href="/">Continue</a></p>`
 	if redirectTo != "" {
-		continueScript = `<script>setTimeout(function(){ window.location = ` + jsonString(redirectTo) + `; }, 400);</script>
-<p>Signed out. <a href="` + esc(redirectTo) + `">Continue</a></p>`
+		v.Set("redirect_to", redirectTo)
 	}
-	page := `<!doctype html><html lang="en"><head><meta charset="utf-8">
-<meta name="viewport" content="width=device-width,initial-scale=1"><title>Signing Out — Access-Nex</title>` + loginStyle + `</head><body>
-<div class="card"><div class="logo">🔐 Access-Nex</div>` + continueScript + `</div>
-` + iframes + `
-</body></html>`
-	w.Header().Set("Content-Type", "text/html; charset=utf-8")
-	w.Write([]byte(page))
-}
-
-func jsonString(s string) string {
-	return `"` + strings.NewReplacer(`\`, `\\`, `"`, `\"`).Replace(s) + `"`
+	http.Redirect(w, r, "/logout?"+v.Encode(), http.StatusFound)
 }

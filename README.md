@@ -1,16 +1,32 @@
 # Access-Nex: OIDC/OAuth2 Provider
 
-A self-hosted OpenID Connect (OIDC) and OAuth 2.0 provider with a management CLI. Register applications, manage users, and federate sign-in through external identity providers (Google, Microsoft, GitHub, Discord, Okta, or any custom OAuth2/OIDC provider). Data is stored in SQLite (zero-config) or PostgreSQL. Ships as a container ([Dockerfile](Dockerfile), [docker-compose.yml](docker-compose.yml)) and exposes a full JSON API so its built-in web UI can be swapped for a custom frontend (see [docs/FRONTEND.md](docs/FRONTEND.md)).
+A self-hosted OpenID Connect (OIDC) and OAuth 2.0 provider with a management CLI. Register applications, manage users, and federate sign-in through external identity providers (Google, Microsoft, GitHub, Discord, Okta, or any custom OAuth2/OIDC provider). Data is stored in SQLite (zero-config) or PostgreSQL.
+
+The system is split into two services (see [docs/FRONTEND.md](docs/FRONTEND.md) for the full picture):
+
+- **Go backend** (`internal/server`) — the OIDC/OAuth2 protocol itself, session/2FA/WebAuthn logic, and the JSON APIs (`/api/v1/*`, `/api/admin/*`). No HTML.
+- **Python/FastAPI frontend** (`frontend/`) — every browser-facing page (home, login, 2FA, consent, portal, admin console, device flow, password reset). It renders templates using the backend's JSON APIs and transparently proxies everything else to the backend, so a browser only ever talks to one origin.
+
+Ships as containers ([Dockerfile](Dockerfile) for the backend, [frontend/Dockerfile](frontend/Dockerfile) for the frontend, wired together in [docker-compose.yml](docker-compose.yml)).
 
 ## Project Structure
 
 ```
 access-nex/
-├── main.go                     # Program entry point (starts the CLI)
+├── main.go                     # Go program entry point (starts the CLI)
+├── main.py                     # Python frontend entry point (FastAPI app)
+├── requirements.txt             # Python frontend dependencies
 ├── Dockerfile, docker-compose.yml, .dockerignore
+├── frontend/                    # Python/FastAPI frontend — every browser-facing page
+│   ├── app.py                   #   routes: render a page, or proxy to the Go backend
+│   ├── backend.py               #   httpx client: JSON calls for page data + the raw proxy
+│   ├── config.py                #   ACCESS_NEX_BACKEND_URL and friends (env vars)
+│   ├── templates/                #   Jinja2 templates (one per page)
+│   ├── static/css, static/js     #   stylesheet + WebAuthn/admin/portal client-side JS
+│   └── Dockerfile
 ├── docs/
 │   ├── openapi.yaml             # Full HTTP API contract
-│   └── FRONTEND.md              # How to swap the built-in HTML frontend for a custom one
+│   └── FRONTEND.md              # The backend/frontend split, and how to replace the frontend again
 ├── go.mod / go.sum
 ├── internal/
 │   ├── cli/
@@ -41,17 +57,18 @@ access-nex/
 │   │   ├── server.go           #   routes, sessions, lockout, per-client + frontend CORS
 │   │   ├── oidc.go             #   /authorize /token /userinfo /introspect /revoke /register ...
 │   │   ├── proxy.go            #   external-provider SSO proxy (/oauth/start, /oauth/callback)
-│   │   ├── web.go              #   dashboard, login form, consent screen, portal
-│   │   ├── apiv1.go            #   /api/v1 JSON account API (for a custom frontend)
-│   │   ├── totp_ui.go          #   2FA enrollment (QR) + login challenge pages
+│   │   ├── web.go              #   direct login + logout: verify credentials, redirect to whichever frontend page comes next
+│   │   ├── apiv1.go            #   /api/v1 JSON account API (for the frontend, or any custom one)
+│   │   ├── page_support.go     #   /api/v1 data the frontend needs to render (stats, app directory, 2FA/device status) — not a stable contract
+│   │   ├── totp_ui.go          #   2FA enrollment/disable mutations (rendering is the frontend's)
 │   │   ├── webauthn.go         #   passkey/security-key registration + login (FIDO2)
 │   │   ├── portal_self.go      #   self-service: password, grants, sessions, identities
-│   │   ├── reset.go            #   forgot/reset password, email verification
+│   │   ├── reset.go            #   forgot/reset password, email verification (mutations only)
 │   │   ├── device.go           #   RFC 8628 device authorization grant
 │   │   ├── tokenexchange.go    #   RFC 8693 token exchange
 │   │   ├── dpop.go             #   RFC 9449 DPoP proof validation + server-issued nonce
-│   │   ├── logout.go           #   back-channel + front-channel logout notification
-│   │   ├── admin.go            #   /admin UI + /api/admin/* JSON API
+│   │   ├── logout.go           #   back-channel logout notification + front-channel redirect
+│   │   ├── admin.go            #   /api/admin/* JSON API (the /admin page itself is the frontend's)
 │   │   ├── metrics.go          #   Prometheus /metrics
 │   │   ├── ratelimit.go        #   per-IP rate limiting
 │   │   ├── jwe.go              #   ID-token encryption (RSA-OAEP-256 + A256GCM)
@@ -118,13 +135,17 @@ go build -o access-nex .
 # 3. (Optional) Add an external provider from a template
 ./access-nex provider add -n "Google SSO" -t google -c GOOGLE_CLIENT_ID -s GOOGLE_CLIENT_SECRET
 
-# 4. Start the server (auto-initializes the local provider on first run)
+# 4. Start the Go backend (auto-initializes the local provider on first run)
 ./access-nex server --addr :8080
+
+# 5. In another terminal, start the Python frontend (this is what browsers talk to)
+pip install -r requirements.txt
+uvicorn main:app --host 0.0.0.0 --port 8000
 ```
 
-Or with Docker: `docker compose up -d` (see [docker-compose.yml](docker-compose.yml) for first-time setup commands).
+Or with Docker: `docker compose up -d` (see [docker-compose.yml](docker-compose.yml) for first-time setup commands) — this starts both services and only publishes the frontend's port.
 
-Open http://localhost:8080 for the dashboard, or http://localhost:8080/login to sign in and get ready-to-paste OAuth client configuration (e.g. for Portainer).
+Open http://localhost:8000 (or `:8080` under Docker Compose, per that file's port mapping) for the dashboard, or `/login` to sign in and get ready-to-paste OAuth client configuration (e.g. for Portainer). Point a browser at the frontend, not directly at the Go backend's port — the backend has no pages of its own anymore.
 
 ## CLI Commands
 
@@ -165,13 +186,14 @@ The full contract, including request/response bodies, is in [docs/openapi.yaml](
 | `GET /jwks` | Public signing keys (all non-retired) |
 | `POST /introspect`, `/revoke` | RFC 7662 / 7009 |
 | `POST /register` | RFC 7591 dynamic client registration (persisted to SQL) |
-| `POST /device_authorize`, `GET/POST /device` | RFC 8628 device authorization grant |
+| `POST /device_authorize`, `POST /device` | RFC 8628 device authorization grant (approve/deny; the entry/confirm page is the frontend's, backed by `GET /api/v1/device`) |
 | `GET /oauth/providers`, `/oauth/start`, `/oauth/callback` | External-provider SSO proxy |
-| `POST /api/v1/*` | JSON account API (login, 2FA, password, sessions, grants, identities) for a custom frontend |
+| `/api/v1/*` | JSON account API (login, 2FA, password, sessions, grants, identities) for the frontend, or any custom one |
 | `POST /portal/webauthn/*`, `/login/webauthn/*` | Passkey/security-key registration and login (JSON) |
-| `GET /admin`, `/api/admin/*` | Admin console + JSON API (requires an admin user) |
+| `/api/admin/*` | Admin JSON API (requires an admin user; the `/admin` console itself is the frontend's) |
 | `GET /metrics` | Prometheus metrics |
-| `GET /`, `/login`, `/portal`, `/apps`, `/forgot-password`, `/reset-password`, `/verify-email` | Web UI |
+
+Everything above is served by the Go backend directly. Every browser-facing page (`/`, `/login`, `/login/2fa`, `/consent`, `/portal`, `/portal/2fa`, `/admin`, `/device`, `/apps`, `/forgot-password`, `/reset-password`, `/message`, `/logout`) is served by the Python frontend, which renders templates from the JSON API above and transparently proxies everything else to the backend.
 
 ### Consent
 
@@ -233,7 +255,7 @@ A client that generates an EC (P-256) or RSA key pair and sends a signed `DPoP` 
 
 ### Admin console
 
-Give a user admin rights (`access-nex user promote -u alice` or `user add --admin`), sign in at `/login`, then open `/admin` to manage users, applications, and providers and to view the audit log in the browser.
+Give a user admin rights (`access-nex user promote -u alice` or `user add --admin`), sign in at `/login`, then open `/admin` to manage users, applications, and providers and to view the audit log in the browser. The page itself is rendered by the Python frontend; it drives the Go backend's `/api/admin/*` JSON API directly from the browser.
 
 ### External provider flow
 
@@ -241,7 +263,7 @@ Give a user admin rights (`access-nex user promote -u alice` or `user add --admi
 
 ## Swapping the frontend
 
-The server-rendered HTML pages (`/login`, `/portal`, `/admin`, `/device`) are optional — everything they do is also reachable as JSON under `/api/v1` (account management), `/api/admin` (admin), and the WebAuthn endpoints. A custom frontend, in Python or anything else, can replace them entirely without touching the Go server. See [docs/FRONTEND.md](docs/FRONTEND.md) for the recommended topology (same-origin via reverse proxy, or a cross-origin SPA with `--frontend-origin`) and [docs/openapi.yaml](docs/openapi.yaml) for the full contract.
+The Python/FastAPI frontend in `frontend/` isn't special-cased by the Go backend — it's just the first consumer of a fully JSON-first API surface. Every page it renders (`/login`, `/portal`, `/admin`, `/device`, ...) is backed entirely by `/api/v1` (account management), `/api/admin` (admin), and the WebAuthn endpoints, so it can be replaced with a different frontend, in any language, without touching the Go server at all. See [docs/FRONTEND.md](docs/FRONTEND.md) for the recommended topology (same-origin via reverse proxy — which is exactly what `frontend/` does for the shipped frontend — or a cross-origin SPA with `--frontend-origin`) and [docs/openapi.yaml](docs/openapi.yaml) for the full contract.
 
 ## Observability
 
@@ -257,7 +279,9 @@ docker compose exec access-nex access-nex --db "$ACCESS_NEX_DB" user add -u admi
 docker compose exec access-nex access-nex --db "$ACCESS_NEX_DB" app create -n "My App" -r https://your-app/callback
 ```
 
-[docker-compose.yml](docker-compose.yml) runs access-nex + PostgreSQL (see [Database](#database) for why Postgres, not SQLite, is the compose default). The image is a multi-stage build ([Dockerfile](Dockerfile)) producing a fully static binary (`CGO_ENABLED=0`, pure-Go SQLite/Postgres drivers) on `gcr.io/distroless/static-debian12:nonroot` — no shell, no package manager, runs as a non-root user. The local provider auto-initializes on first `server` start, so no separate init step is needed in a container that has no shell to script one with.
+[docker-compose.yml](docker-compose.yml) runs three services: PostgreSQL, the Go backend (`access-nex`, see [Database](#database) for why Postgres, not SQLite, is the compose default), and the Python frontend (`frontend`). Only `frontend` publishes a host port (`8080:8000`) — it's the single origin browsers and OAuth clients reach; `access-nex` itself isn't published, only reachable at `http://access-nex:8080` inside the compose network (which is also how `frontend` reaches it, via `ACCESS_NEX_BACKEND_URL`).
+
+The backend image is a multi-stage build ([Dockerfile](Dockerfile)) producing a fully static binary (`CGO_ENABLED=0`, pure-Go SQLite/Postgres drivers) on `gcr.io/distroless/static-debian12:nonroot` — no shell, no package manager, runs as a non-root user. The local provider auto-initializes on first `server` start, so no separate init step is needed in a container that has no shell to script one with. The frontend image ([frontend/Dockerfile](frontend/Dockerfile)) is a plain `python:3.12-slim` running `uvicorn`.
 
 On the same Docker network, other containers (Portainer, your app) reach access-nex at `http://access-nex:8080` directly — no `host.docker.internal` workaround needed there, unlike when access-nex runs as a bare process on the host (see below).
 
@@ -265,18 +289,18 @@ On the same Docker network, other containers (Portainer, your app) reach access-
 
 Portainer's OAuth settings make **two kinds** of requests:
 
-- **Browser-side** (Authorization URL, Logout URL) — resolved on *your* machine, so `localhost:8080` works.
-- **Server-side** (Access Token URL, Resource URL) — made from *inside the Portainer container*, where `localhost` is the container itself. Use `host.docker.internal` instead (or, if both are Docker containers on the same compose network, the access-nex service name — see [Docker](#docker) above).
+- **Browser-side** (Authorization URL, Logout URL) — resolved on *your* machine, so wherever the frontend is published (`localhost:8080` under `docker-compose.yml`, or `localhost:8000` if you ran `uvicorn` directly per the Quick Start) works. These get proxied straight through to the backend, so the URL is the same as if the backend were public.
+- **Server-side** (Access Token URL, Resource URL) — made from *inside the Portainer container*, where `localhost` is the container itself. Use `host.docker.internal` instead (or, if both are Docker containers on the same compose network, the access-nex service name — see [Docker](#docker) above), pointed at whichever service Portainer can actually reach: the Go backend directly if it's on that network, or the frontend if not.
 
-Working configuration for Portainer at `https://localhost:9443`:
+Working configuration for Portainer at `https://localhost:9443`, with access-nex reachable via `docker-compose.yml` (frontend published at `:8080`):
 
 | Portainer setting | Value |
 |-------------------|-------|
 | Provider | Custom |
 | Client ID / Secret | from `access-nex app create` output |
 | Authorization URL | `http://localhost:8080/authorize` |
-| Access Token URL | `http://host.docker.internal:8080/token` |
-| Resource URL | `http://host.docker.internal:8080/userinfo` |
+| Access Token URL | `http://access-nex:8080/token` (same compose network) or `http://host.docker.internal:8080/token` (backend published directly on the host) |
+| Resource URL | `http://access-nex:8080/userinfo` or `http://host.docker.internal:8080/userinfo` |
 | Redirect URL | `https://localhost:9443/` (must exactly match a registered redirect URI) |
 | Logout URL | `http://localhost:8080/end_session` |
 | User Identifier | `email` |

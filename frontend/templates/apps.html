@@ -1,0 +1,25 @@
+{% extends "base_app.html" %}
+{% block content %}
+<div class="page-header">
+  <div class="page-title">Registered Applications</div>
+  <div class="page-sub">OAuth2/OIDC clients registered with this provider</div>
+</div>
+<div class="card">
+  <table>
+    <thead><tr><th>Name</th><th>Client ID</th><th>Type</th><th>Redirect URIs</th></tr></thead>
+    <tbody>
+      {% for a in apps %}
+      <tr>
+        <td class="td-name">{{ a.name }}</td>
+        <td><code>{{ a.id }}</code></td>
+        <td>{{ 'Public (PKCE)' if a.public else 'Confidential' }}</td>
+        <td>{% for u in a.redirect_uris %}<div style="font-size:13px;margin-bottom:4px">{{ u }}</div>{% endfor %}</td>
+      </tr>
+      {% else %}
+      <tr class="empty-row"><td colspan="4">No applications registered</td></tr>
+      {% endfor %}
+    </tbody>
+  </table>
+</div>
+<p><a href="/">← Back to home</a></p>
+{% endblock %}

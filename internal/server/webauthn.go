@@ -339,17 +339,13 @@ func (s *Server) handleWebAuthnLoginFinish(w http.ResponseWriter, r *http.Reques
 	writeJSON(w, http.StatusOK, map[string]string{"status": "signed_in"})
 }
 
-// webauthnSecurityKeyButton is the button both challenge pages show
-// alongside the TOTP form when the pending user has a registered credential.
-func webauthnSecurityKeyButton() string {
-	return `<button type="button" onclick="useSecurityKey()" style="margin-top:10px;width:100%;padding:12px;background:#eee;color:#333;border:none;border-radius:6px;font-size:15px;font-weight:600;cursor:pointer">🔑 Use Security Key</button>
-<p id="wa-msg" style="margin-top:8px;font-size:13px;color:#888;text-align:center"></p>`
-}
-
 // authorizeQuery re-encodes an authRequest's fields as a URL query string,
 // used to rebuild the original /authorize URL so the browser can navigate
 // straight back into the OAuth flow once a WebAuthn login sets the session
 // cookie (the mid-flow challenge page is otherwise a dead end for GETs).
+// The equivalent client-side ceremony (begin/get()/finish, base64url
+// conversions) now lives in the Python frontend's static JS — see
+// docs/FRONTEND.md — since it only ever talks to the JSON endpoints above.
 func authorizeQuery(req authRequest) string {
 	v := url.Values{}
 	for k, val := range req.fields() {
@@ -358,102 +354,4 @@ func authorizeQuery(req authRequest) string {
 		}
 	}
 	return v.Encode()
-}
-
-// webauthnLoginScript is embedded on both second-factor challenge pages
-// (the direct /login flow and the /authorize flow) to drive the
-// begin/get()/finish ceremony. `formSelector` identifies the surrounding
-// <form> so the totp_token field can be read from it; `onSuccess` is JS run
-// after the session cookie is set (each page redirects somewhere different).
-// webauthnJSHelpers are the base64url<->ArrayBuffer conversion functions
-// shared by both the registration script (portal) and the login script
-// (challenge pages) — included once per page since script-scope functions
-// would otherwise collide if both were ever present together.
-func webauthnJSHelpers() string {
-	return `
-<script>
-function b64urlToBuf(s) {
-  s = s.replace(/-/g,'+').replace(/_/g,'/');
-  while (s.length % 4) s += '=';
-  var bin = atob(s), buf = new Uint8Array(bin.length);
-  for (var i=0;i<bin.length;i++) buf[i] = bin.charCodeAt(i);
-  return buf.buffer;
-}
-function bufToB64url(buf) {
-  var bytes = new Uint8Array(buf), bin = '';
-  for (var i=0;i<bytes.length;i++) bin += String.fromCharCode(bytes[i]);
-  return btoa(bin).replace(/\+/g,'-').replace(/\//g,'_').replace(/=+$/,'');
-}
-</script>`
-}
-
-func webauthnLoginScript(formSelector, onSuccess string) string {
-	return `
-<script>
-async function useSecurityKey() {
-  var token = document.querySelector('` + formSelector + ` [name=totp_token]').value;
-  var msg = document.getElementById('wa-msg');
-  msg.textContent = 'Waiting for your security key…';
-  try {
-    var beginRes = await fetch('/login/webauthn/begin', {method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify({token: token})});
-    var begin = await beginRes.json();
-    if (!beginRes.ok) { msg.textContent = begin.error || 'No security key available'; return; }
-    var pk = begin.publicKey;
-    pk.challenge = b64urlToBuf(pk.challenge);
-    if (pk.allowCredentials) pk.allowCredentials.forEach(function(c){ c.id = b64urlToBuf(c.id); });
-    var assertion = await navigator.credentials.get({publicKey: pk});
-    var credJSON = assertion.toJSON ? assertion.toJSON() : {
-      id: assertion.id, rawId: bufToB64url(assertion.rawId), type: assertion.type,
-      response: {
-        clientDataJSON: bufToB64url(assertion.response.clientDataJSON),
-        authenticatorData: bufToB64url(assertion.response.authenticatorData),
-        signature: bufToB64url(assertion.response.signature),
-        userHandle: assertion.response.userHandle ? bufToB64url(assertion.response.userHandle) : null
-      }
-    };
-    var finishRes = await fetch('/login/webauthn/finish', {method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify({token: token, waToken: begin.waToken, credential: credJSON})});
-    var finish = await finishRes.json();
-    if (!finishRes.ok) { msg.textContent = finish.error || 'Verification failed'; return; }
-    ` + onSuccess + `
-  } catch (e) {
-    msg.textContent = 'Security key error: ' + e.message;
-  }
-}
-</script>`
-}
-
-// webauthnRegisterScript drives the portal "add a security key" ceremony.
-func webauthnRegisterScript() string {
-	return `
-<script>
-async function registerSecurityKey() {
-  var name = prompt('Name this security key (e.g. "YubiKey", "Touch ID"):', 'Security key');
-  if (name === null) return;
-  var msg = document.getElementById('wa-reg-msg');
-  msg.textContent = 'Waiting for your security key…';
-  try {
-    var beginRes = await fetch('/portal/webauthn/register/begin', {method:'POST'});
-    var begin = await beginRes.json();
-    if (!beginRes.ok) { msg.textContent = begin.error || 'Could not start registration'; return; }
-    var pk = begin.publicKey;
-    pk.challenge = b64urlToBuf(pk.challenge);
-    pk.user.id = b64urlToBuf(pk.user.id);
-    if (pk.excludeCredentials) pk.excludeCredentials.forEach(function(c){ c.id = b64urlToBuf(c.id); });
-    var cred = await navigator.credentials.create({publicKey: pk});
-    var credJSON = cred.toJSON ? cred.toJSON() : {
-      id: cred.id, rawId: bufToB64url(cred.rawId), type: cred.type,
-      response: {
-        clientDataJSON: bufToB64url(cred.response.clientDataJSON),
-        attestationObject: bufToB64url(cred.response.attestationObject)
-      }
-    };
-    var finishRes = await fetch('/portal/webauthn/register/finish', {method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify({token: begin.token, name: name, credential: credJSON})});
-    var finish = await finishRes.json();
-    if (!finishRes.ok) { msg.textContent = finish.error || 'Registration failed'; return; }
-    window.location.reload();
-  } catch (e) {
-    msg.textContent = 'Error: ' + e.message;
-  }
-}
-</script>`
 }

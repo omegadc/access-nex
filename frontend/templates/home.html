@@ -1,0 +1,44 @@
+{% extends "base_app.html" %}
+{% block content %}
+<div class="page-header">
+  <div class="page-title">OAuth2 &amp; OpenID Connect Provider</div>
+  <div class="page-sub">Issuer: <code>{{ stats.issuer }}</code></div>
+</div>
+
+<div class="stats-grid">
+  <div class="stat-card"><div class="stat-label">Status</div><div class="stat-value"><span class="badge badge-green">✓ Running</span></div></div>
+  <div class="stat-card"><div class="stat-label">Users</div><div class="stat-value">{{ stats.users }}</div></div>
+  <div class="stat-card"><div class="stat-label">Applications</div><div class="stat-value">{{ stats.apps }}</div></div>
+  <div class="stat-card"><div class="stat-label">Ext. Providers</div><div class="stat-value">{{ stats.external_providers }}</div></div>
+</div>
+
+<div class="card">
+  <div class="card-header"><span class="card-title">OIDC / OAuth2 Endpoints</span></div>
+  <div class="card-body">
+    <p style="margin-bottom:8px"><span class="badge badge-blue">GET</span> <a href="/.well-known/openid-configuration">/.well-known/openid-configuration</a> — Discovery</p>
+    <p style="margin-bottom:8px"><span class="badge badge-blue">GET/POST</span> /authorize — Authorization</p>
+    <p style="margin-bottom:8px"><span class="badge badge-blue">POST</span> /token — Token exchange</p>
+    <p style="margin-bottom:8px"><span class="badge badge-blue">GET</span> /userinfo — User claims</p>
+    <p style="margin-bottom:8px"><span class="badge badge-blue">GET</span> <a href="/jwks">/jwks</a> — Public key set</p>
+    <p><span class="badge badge-blue">POST</span> /revoke &nbsp;/introspect &nbsp;/register &nbsp;/end_session</p>
+  </div>
+</div>
+
+<div class="card">
+  <div class="card-header"><span class="card-title">OAuth Proxy (External Providers)</span></div>
+  <div class="card-body">
+    <p style="margin-bottom:8px"><span class="badge badge-blue">GET</span> <a href="/oauth/providers">/oauth/providers</a> — list enabled external providers</p>
+    <p style="margin-bottom:8px"><span class="badge badge-blue">GET</span> /oauth/start?provider_id=X&amp;client_id=Y&amp;redirect_uri=Z — begin SSO</p>
+    <p><span class="badge badge-blue">GET</span> /oauth/callback — receive code → issue local auth code</p>
+  </div>
+</div>
+
+<div class="card">
+  <div class="card-header"><span class="card-title">Quick Links</span></div>
+  <div class="card-body" style="display:flex;gap:10px;flex-wrap:wrap">
+    <a class="btn" href="/apps">Applications</a>
+    {% if not user %}<a class="btn" href="/login">Login Portal</a>{% else %}<a class="btn" href="/portal">My Account</a>{% endif %}
+    <a class="btn" href="/.well-known/openid-configuration">Discovery Doc</a>
+  </div>
+</div>
+{% endblock %}

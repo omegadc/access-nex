@@ -158,14 +158,14 @@ func (s *Server) handleAuthorize(w http.ResponseWriter, r *http.Request) {
 	if r.Method == http.MethodPost && r.Form.Get("totp_code") != "" {
 		pendingSubject, ok := s.consumeTOTPPending(r.Form.Get("totp_token"))
 		if !ok {
-			s.renderLogin(w, req, client.Name, "Session expired — sign in again")
+			s.redirectToOAuthLogin(w, r, req, client.Name, "Session expired — sign in again")
 			return
 		}
 		user := s.userBySubject(pendingSubject)
 		if user == nil || !user.TOTPEnabled || !secrets.VerifyTOTP(user.TOTPSecret, r.Form.Get("totp_code")) {
 			s.store.Audit("login_2fa_failed", pendingSubject, client.ID, clientIP(r), "")
 			s.metrics.loginResults.WithLabelValues("2fa_failed").Inc()
-			s.renderTOTPChallenge(w, req, client.Name, pendingSubject, s.newTOTPPending(pendingSubject), "Invalid code — try again")
+			s.redirectToOAuthTOTP(w, r, req, client.Name, s.newTOTPPending(pendingSubject), "Invalid code — try again")
 			return
 		}
 		s.store.Audit("login_success", pendingSubject, client.ID, clientIP(r), "with 2FA")
@@ -179,7 +179,7 @@ func (s *Server) handleAuthorize(w http.ResponseWriter, r *http.Request) {
 	if r.Method == http.MethodPost && r.Form.Get("consent") != "" {
 		subject, ok := s.subjectFromSession(r)
 		if !ok {
-			s.renderLogin(w, req, client.Name, "Session expired — sign in again")
+			s.redirectToOAuthLogin(w, r, req, client.Name, "Session expired — sign in again")
 			return
 		}
 		scope := parseScope(req.Scope)
@@ -210,16 +210,16 @@ func (s *Server) handleAuthorize(w http.ResponseWriter, r *http.Request) {
 		}
 		if r.Method == http.MethodPost && r.Form.Get("username") != "" {
 			if !s.loginLimiter.allow(clientIP(r)) {
-				s.renderLogin(w, req, client.Name, "Too many attempts — try again in a minute")
+				s.redirectToOAuthLogin(w, r, req, client.Name, "Too many attempts — try again in a minute")
 				return
 			}
 			user, ok := s.verifyPassword(r.Form.Get("username"), r.Form.Get("password"), clientIP(r))
 			if !ok {
-				s.renderLogin(w, req, client.Name, "Invalid username or password")
+				s.redirectToOAuthLogin(w, r, req, client.Name, "Invalid username or password")
 				return
 			}
 			if user.TOTPEnabled || s.hasWebAuthnCredentials(user.Subject) {
-				s.renderTOTPChallenge(w, req, client.Name, user.Subject, s.newTOTPPending(user.Subject), "")
+				s.redirectToOAuthTOTP(w, r, req, client.Name, s.newTOTPPending(user.Subject), "")
 				return
 			}
 			s.store.Audit("login_success", user.Subject, client.ID, clientIP(r), "")
@@ -229,7 +229,7 @@ func (s *Server) handleAuthorize(w http.ResponseWriter, r *http.Request) {
 			// prompt=login is satisfied by the fresh authentication.
 			forceLogin = false
 		} else {
-			s.renderLogin(w, req, client.Name, "")
+			s.redirectToOAuthLogin(w, r, req, client.Name, "")
 			return
 		}
 	}
@@ -252,7 +252,7 @@ func (s *Server) continueAuthorizeAfterLogin(w http.ResponseWriter, r *http.Requ
 			s.deliverAuthError(w, r, req, "consent_required", "Consent required")
 			return
 		}
-		s.renderConsent(w, req, client, s.userBySubject(subject), scope)
+		s.redirectToConsent(w, r, req, client.Name, scope)
 		return
 	}
 	s.issueAuthorizationCode(w, r, req, subject)
@@ -827,7 +827,7 @@ func (s *Server) handleEndSession(w http.ResponseWriter, r *http.Request) {
 	if hadSession {
 		go s.notifyBackchannelLogout(subject)
 		if uris := s.frontchannelLogoutURIs(subject); len(uris) > 0 {
-			s.renderFrontchannelLogoutPage(w, uris, redirectTo)
+			s.redirectToLogoutPage(w, r, uris, redirectTo)
 			return
 		}
 	}

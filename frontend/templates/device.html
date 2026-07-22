@@ -1,0 +1,31 @@
+{% extends "base_auth.html" %}
+{% block subtitle %}Device Sign-In{% endblock %}
+{% block content %}
+{% if error %}<div class="alert alert-error">{{ error }}</div>{% endif %}
+{% if mode == 'confirm' %}
+<h1>Connect this device?</h1>
+<p class="auth-hint"><strong>{{ client_name }}</strong> wants access to:</p>
+<ul class="scopes">
+  {% for sc in scopes %}
+  <li><strong>{{ sc }}</strong> — {{ scope_descriptions.get(sc, "Scope: " + sc) }}</li>
+  {% endfor %}
+</ul>
+<form method="post" action="/device">
+  <input type="hidden" name="user_code" value="{{ user_code }}">
+  <div class="btnrow">
+    <button type="submit" name="decision" value="approve" class="btn btn-primary">Allow</button>
+    <button type="submit" name="decision" value="deny" class="btn">Deny</button>
+  </div>
+</form>
+{% else %}
+<h1>Enter Code</h1>
+<p class="auth-hint">Enter the code shown on your device.</p>
+<form method="get" action="/device">
+  <div class="field">
+    <label for="c">Code</label>
+    <input type="text" id="c" name="user_code" value="{{ prefill }}" placeholder="XXXX-XXXX" style="text-transform:uppercase" required autofocus>
+  </div>
+  <button type="submit" class="btn btn-primary btn-block">Continue</button>
+</form>
+{% endif %}
+{% endblock %}

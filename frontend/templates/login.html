@@ -1,0 +1,27 @@
+{% extends "base_auth.html" %}
+{% block subtitle %}{% if mode == 'oauth' %}Authorize{% else %}Admin Portal{% endif %}{% endblock %}
+{% block content %}
+{% if error %}<div class="alert alert-error">{{ error }}</div>{% endif %}
+<h1>{% if mode == 'oauth' %}Welcome{% else %}Sign In{% endif %}</h1>
+{% if mode == 'oauth' %}
+  {% if client_name %}<div class="auth-app-info"><strong>Signing in to:</strong><br>{{ client_name }}</div>{% endif %}
+  <p class="auth-hint">Sign in with your {{ brand }} account to continue</p>
+  <form method="post" action="/authorize">
+    {% for k, v in fields.items() %}{% if v %}<input type="hidden" name="{{ k }}" value="{{ v }}">{% endif %}{% endfor %}
+    <div class="field"><label for="username">Username</label><input type="text" id="username" name="username" autocomplete="username" required autofocus></div>
+    <div class="field"><label for="password">Password</label><input type="password" id="password" name="password" autocomplete="current-password" required></div>
+    <button type="submit" class="btn btn-primary btn-block">Sign In</button>
+  </form>
+{% else %}
+  <p class="auth-hint">Enter your {{ brand }} credentials to validate your account and inspect session details.</p>
+  <form method="post" action="/login">
+    <input type="hidden" name="return_to" value="{{ return_to }}">
+    <div class="field"><label for="username">Username</label><input type="text" id="username" name="username" autocomplete="username" required autofocus></div>
+    <div class="field"><label for="password">Password</label><input type="password" id="password" name="password" autocomplete="current-password" required></div>
+    <button type="submit" class="btn btn-primary btn-block">Sign In</button>
+  </form>
+{% endif %}
+<div class="auth-footer">
+  <a href="/forgot-password">Forgot password?</a> · <a href="/">← Back to home</a>
+</div>
+{% endblock %}

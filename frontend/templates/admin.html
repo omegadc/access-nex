@@ -1,0 +1,65 @@
+{% extends "base_app.html" %}
+{% block content %}
+<div class="page-header">
+  <div class="page-title">Admin Console</div>
+</div>
+
+<div class="card">
+  <div class="card-header"><span class="card-title">Users</span></div>
+  <div class="card-body">
+    <div class="toolbar">
+      <input type="text" id="nu-user" placeholder="username">
+      <input type="password" id="nu-pass" placeholder="password">
+      <input type="email" id="nu-email" placeholder="email">
+      <input type="text" id="nu-name" placeholder="full name">
+      <label><input type="checkbox" id="nu-admin"> admin</label>
+      <button class="btn btn-primary btn-sm" onclick="createUser()">Add User</button>
+      <span class="msg" id="u-msg"></span>
+    </div>
+  </div>
+  <table>
+    <thead><tr><th>Username</th><th>Email</th><th>Name</th><th>Source</th><th>Admin</th><th></th></tr></thead>
+    <tbody id="users-table"><tr class="empty-row"><td colspan="6">Loading…</td></tr></tbody>
+  </table>
+</div>
+
+<div class="card">
+  <div class="card-header"><span class="card-title">Applications</span></div>
+  <div class="card-body">
+    <div class="toolbar">
+      <input type="text" id="na-name" placeholder="app name">
+      <input type="text" id="na-uri" placeholder="redirect URI" style="min-width:260px">
+      <label><input type="checkbox" id="na-public"> public (PKCE)</label>
+      <button class="btn btn-primary btn-sm" onclick="createApp()">Add App</button>
+      <span class="msg" id="a-msg"></span>
+    </div>
+  </div>
+  <table>
+    <thead><tr><th>Name</th><th>Client ID</th><th>Type</th><th>Redirect URIs</th><th></th></tr></thead>
+    <tbody id="apps-table"><tr class="empty-row"><td colspan="5">Loading…</td></tr></tbody>
+  </table>
+</div>
+
+<div class="card">
+  <div class="card-header"><span class="card-title">External Providers</span></div>
+  <div class="card-body"><p style="font-size:13px;color:var(--text-secondary)">Add providers via the CLI: <code>access-nex provider add -t google ...</code></p></div>
+  <table>
+    <thead><tr><th>Name</th><th>ID</th><th>Kind</th><th>Enabled</th><th></th></tr></thead>
+    <tbody id="prov-table"><tr class="empty-row"><td colspan="5">Loading…</td></tr></tbody>
+  </table>
+</div>
+
+<div class="card">
+  <div class="card-header">
+    <span class="card-title">Audit Log</span>
+    <button class="btn btn-sm" onclick="loadAudit()">Refresh</button>
+  </div>
+  <div style="overflow-x:auto">
+    <table>
+      <thead><tr><th>Time</th><th>Event</th><th>Subject</th><th>Client</th><th>IP</th><th>Detail</th></tr></thead>
+      <tbody id="audit-table"><tr class="empty-row"><td colspan="6">Loading…</td></tr></tbody>
+    </table>
+  </div>
+</div>
+{% endblock %}
+{% block extra_scripts %}<script src="/static/js/admin.js"></script>{% endblock %}

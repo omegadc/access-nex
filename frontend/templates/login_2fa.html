@@ -1,0 +1,43 @@
+{% extends "base_auth.html" %}
+{% block subtitle %}Two-Factor Authentication{% endblock %}
+{% block content %}
+{% if error %}<div class="alert alert-error">{{ error }}</div>{% endif %}
+<h1>Verify it's you</h1>
+{% if mode == 'oauth' and client_name %}<div class="auth-app-info"><strong>Signing in to:</strong><br>{{ client_name }}</div>{% endif %}
+
+<form method="post" action="{{ '/authorize' if mode == 'oauth' else '/login/2fa' }}" id="totp-form">
+  {% if mode == 'oauth' %}
+    {% for k, v in fields.items() %}{% if v %}<input type="hidden" name="{{ k }}" value="{{ v }}">{% endif %}{% endfor %}
+  {% else %}
+    <input type="hidden" name="return_to" value="{{ return_to }}">
+  {% endif %}
+  <input type="hidden" name="totp_token" value="{{ token }}">
+  <p class="auth-hint">Open your authenticator app and enter the current 6-digit code.</p>
+  <div class="field">
+    <label for="c">Code</label>
+    <input type="text" id="c" name="totp_code" inputmode="numeric" pattern="[0-9]*" maxlength="6" autocomplete="one-time-code" required autofocus>
+  </div>
+  <button type="submit" class="btn btn-primary btn-block">Verify</button>
+</form>
+
+<button type="button" class="btn btn-block" style="margin-top:10px" onclick="onUseSecurityKey()">🔑 Use Security Key</button>
+<p id="wa-msg" style="margin-top:8px;font-size:13px;color:var(--text-secondary);text-align:center"></p>
+
+<div class="auth-footer"><a href="/login{{ '?' + qs if mode == 'oauth' else '' }}">← Back to sign in</a></div>
+{% endblock %}
+{% block extra_scripts %}
+<script src="/static/js/webauthn.js"></script>
+<script>
+function onUseSecurityKey() {
+  var token = document.querySelector('#totp-form [name=totp_token]').value;
+  var msg = document.getElementById('wa-msg');
+  useSecurityKeyLogin(token, msg, function () {
+    {% if mode == 'oauth' %}
+    window.location.href = '/authorize?{{ qs|safe }}';
+    {% else %}
+    window.location.href = {{ return_to_json|safe }};
+    {% endif %}
+  });
+}
+</script>
+{% endblock %}

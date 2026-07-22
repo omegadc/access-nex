@@ -1,0 +1,11 @@
+{% extends "base_auth.html" %}
+{% block content %}
+<h1>Signed out.</h1>
+<p class="auth-hint"><a href="{{ redirect_to or '/' }}">Continue</a></p>
+{% for u in uris %}<iframe src="{{ u }}" style="display:none" width="0" height="0"></iframe>{% endfor %}
+{% endblock %}
+{% block extra_scripts %}
+{% if redirect_to %}
+<script>setTimeout(function () { window.location = {{ redirect_to_json|safe }}; }, 400);</script>
+{% endif %}
+{% endblock %}

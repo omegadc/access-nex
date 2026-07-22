@@ -137,8 +137,9 @@ func (s *Server) activeKey() SigningKey { return s.keys[0] }
 func (s *Server) Handler() http.Handler {
 	mux := http.NewServeMux()
 
-	// Local OIDC/OAuth2 endpoints
-	mux.HandleFunc("/", s.handleHome)
+	// Local OIDC/OAuth2 endpoints. There is no "/" route: this server is the
+	// backend only now (see docs/FRONTEND.md) — the Python/FastAPI frontend
+	// owns every browser-facing page and proxies everything else here.
 	mux.HandleFunc("/healthz", s.handleHealth)
 	mux.HandleFunc("/.well-known/openid-configuration", s.handleDiscovery)
 	mux.HandleFunc("/jwks", s.handleJWKS)
@@ -149,27 +150,27 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("/userinfo", s.handleUserInfo)
 	mux.HandleFunc("/register", s.handleRegister)
 	mux.HandleFunc("/end_session", s.handleEndSession)
-	mux.HandleFunc("/apps", s.handleListApps)
 
 	// External OAuth proxy
 	mux.HandleFunc("/oauth/providers", s.handleOAuthProviders)
 	mux.HandleFunc("/oauth/start", s.handleOAuthStart)
 	mux.HandleFunc("/oauth/callback", s.handleOAuthCallback)
 
-	// Portal
-	mux.HandleFunc("/login", s.handleLogin)
-	mux.HandleFunc("/login/2fa", s.handleLoginTOTP)
-	mux.HandleFunc("/portal", s.handlePortal)
+	// Portal (form submissions the frontend's pages post to; GET rendering
+	// of /login, /login/2fa, and /portal itself is entirely the frontend's
+	// job now, backed by /api/v1/* below)
+	mux.HandleFunc("POST /login", s.handleLogin)
+	mux.HandleFunc("POST /login/2fa", s.handleLoginTOTP)
 	mux.HandleFunc("/portal/logout", s.handlePortalLogout)
 
 	// Password reset + email verification
-	mux.HandleFunc("/forgot-password", s.handleForgotPassword)
-	mux.HandleFunc("/reset-password", s.handleResetPassword)
+	mux.HandleFunc("POST /forgot-password", s.handleForgotPassword)
+	mux.HandleFunc("POST /reset-password", s.handleResetPassword)
 	mux.HandleFunc("/verify-email", s.handleVerifyEmail)
 	mux.HandleFunc("POST /portal/verify-email/resend", s.handlePortalResendVerification)
 
-	// Portal self-service
-	mux.HandleFunc("GET /portal/2fa", s.handleTOTPPage)
+	// Portal self-service (GET /portal/2fa's rendering is the frontend's,
+	// backed by GET /api/v1/totp below)
 	mux.HandleFunc("POST /portal/2fa/enroll", s.handleTOTPEnroll)
 	mux.HandleFunc("POST /portal/2fa/confirm", s.handleTOTPConfirm)
 	mux.HandleFunc("POST /portal/2fa/disable", s.handleTOTPDisable)
@@ -185,12 +186,23 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("POST /login/webauthn/begin", s.handleWebAuthnLoginBegin)
 	mux.HandleFunc("POST /login/webauthn/finish", s.handleWebAuthnLoginFinish)
 
-	// RFC 8628 device authorization grant
+	// RFC 8628 device authorization grant (GET /device's rendering is the
+	// frontend's, backed by GET /api/v1/device below)
 	mux.HandleFunc("POST /device_authorize", s.handleDeviceAuthorize)
-	mux.HandleFunc("/device", s.handleDeviceVerify)
+	mux.HandleFunc("POST /device", s.handleDeviceVerify)
 
-	// Admin UI + JSON API (session + is_admin required)
-	mux.HandleFunc("GET /admin", s.requireAdminPage(s.handleAdminPage))
+	// Frontend support data — not part of the stable /api/v1 contract in
+	// docs/openapi.yaml, just what the frontend's pages need to render
+	// (see page_support.go).
+	mux.HandleFunc("GET /api/v1/stats", s.apiV1PublicStats)
+	mux.HandleFunc("GET /api/v1/apps/public", s.apiV1PublicApps)
+	mux.HandleFunc("GET /api/v1/apps/configs", s.requireSessionAPI(s.apiV1AppConfigs))
+	mux.HandleFunc("GET /api/v1/stats/active", s.requireSessionAPI(s.apiV1ActiveStats))
+	mux.HandleFunc("GET /api/v1/totp", s.requireSessionAPI(s.apiV1TOTPStatus))
+	mux.HandleFunc("GET /api/v1/device", s.requireSessionAPI(s.apiV1DeviceInfo))
+
+	// Admin JSON API (session + is_admin required); the /admin console
+	// itself is rendered by the frontend and drives this directly.
 	mux.HandleFunc("GET /api/admin/users", s.requireAdminAPI(s.apiListUsers))
 	mux.HandleFunc("POST /api/admin/users", s.requireAdminAPI(s.apiCreateUser))
 	mux.HandleFunc("DELETE /api/admin/users/{username}", s.requireAdminAPI(s.apiDeleteUser))

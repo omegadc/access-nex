@@ -6,12 +6,15 @@ package server
 //
 //  1. POST /device_authorize (device)      → device_code + user_code
 //  2. GET  /device?user_code=XXXX-XXXX (browser, logged in) → approve/deny
+//     (rendered by the Python frontend, backed by GET /api/v1/device — see
+//     page_support.go)
 //  3. POST /token grant_type=...device_code (device, polling) → tokens once approved
 
 import (
 	"crypto/rand"
 	"net/http"
 	"net/url"
+	"strconv"
 	"strings"
 	"time"
 
@@ -87,116 +90,31 @@ func (s *Server) handleDeviceAuthorize(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
-// handleDeviceVerify is the browser-facing page: enter the code, then
-// approve or deny the device.
+// handleDeviceVerify is the approve/deny decision posted from the frontend's
+// /device page (GET /api/v1/device supplies that page the code/client/scope
+// details to render — see page_support.go).
 func (s *Server) handleDeviceVerify(w http.ResponseWriter, r *http.Request) {
 	subject, ok := s.subjectFromSession(r)
 	if !ok {
 		http.Redirect(w, r, "/login?return_to="+url.QueryEscape(r.URL.RequestURI()), http.StatusFound)
 		return
 	}
-
-	if r.Method == http.MethodPost {
-		if err := r.ParseForm(); err != nil {
-			http.Error(w, "bad request", http.StatusBadRequest)
-			return
-		}
-		userCode := strings.ToUpper(strings.TrimSpace(r.Form.Get("user_code")))
-		decision := r.Form.Get("decision")
-		status := models.DeviceStatusDenied
-		if decision == "approve" {
-			status = models.DeviceStatusApproved
-		}
-		if err := s.store.ResolveDeviceCode(userCode, subject, status); err != nil {
-			s.renderDevicePage(w, "", "That code is invalid or has expired.")
-			return
-		}
-		s.store.Audit("device_"+status, subject, "", clientIP(r), userCode)
-		s.renderDeviceResult(w, status == models.DeviceStatusApproved)
+	if err := r.ParseForm(); err != nil {
+		http.Error(w, "bad request", http.StatusBadRequest)
 		return
 	}
-
-	userCode := strings.ToUpper(strings.TrimSpace(r.URL.Query().Get("user_code")))
-	if userCode == "" {
-		s.renderDevicePage(w, "", "")
+	userCode := strings.ToUpper(strings.TrimSpace(r.Form.Get("user_code")))
+	decision := r.Form.Get("decision")
+	status := models.DeviceStatusDenied
+	if decision == "approve" {
+		status = models.DeviceStatusApproved
+	}
+	if err := s.store.ResolveDeviceCode(userCode, subject, status); err != nil {
+		http.Redirect(w, r, "/device?error=invalid", http.StatusFound)
 		return
 	}
-	d, err := s.store.GetDeviceCodeByUserCode(userCode)
-	if err != nil || d.Status != models.DeviceStatusPending || time.Now().After(d.ExpiresAt) {
-		s.renderDevicePage(w, "", "That code is invalid or has expired.")
-		return
-	}
-	client := s.clientByID(d.ClientID)
-	clientName := d.ClientID
-	if client != nil {
-		clientName = client.Name
-	}
-	s.renderDeviceConfirm(w, userCode, clientName, d.Scope)
-}
-
-func (s *Server) renderDevicePage(w http.ResponseWriter, prefill, errMsg string) {
-	errHTML := ""
-	if errMsg != "" {
-		errHTML = `<div class="error">` + esc(errMsg) + `</div>`
-	}
-	page := `<!doctype html><html lang="en"><head><meta charset="utf-8">
-<meta name="viewport" content="width=device-width,initial-scale=1"><title>Device Sign-In — Access-Nex</title>` + loginStyle + `</head><body>
-<div class="card">
-  <div class="logo">🔐 Access-Nex</div><div class="sub">Device Sign-In</div>` + errHTML + `
-  <h1>Enter Code</h1>
-  <p class="hint">Enter the code shown on your device.</p>
-  <form method="GET" action="/device">
-    <label for="c">Code</label>
-    <input type="text" id="c" name="user_code" value="` + esc(prefill) + `" placeholder="XXXX-XXXX" style="text-transform:uppercase" required autofocus>
-    <button type="submit">Continue</button>
-  </form>
-</div></body></html>`
-	w.Header().Set("Content-Type", "text/html; charset=utf-8")
-	w.Write([]byte(page))
-}
-
-func (s *Server) renderDeviceConfirm(w http.ResponseWriter, userCode, clientName string, scopes []string) {
-	scopeItems := ""
-	for _, sc := range scopes {
-		desc := scopeDescriptions[sc]
-		if desc == "" {
-			desc = "Scope: " + sc
-		}
-		scopeItems += `<li><strong>` + esc(sc) + `</strong> — ` + esc(desc) + `</li>`
-	}
-	page := `<!doctype html><html lang="en"><head><meta charset="utf-8">
-<meta name="viewport" content="width=device-width,initial-scale=1"><title>Device Sign-In — Access-Nex</title>` + loginStyle + `<style>
-ul.scopes{margin:0 0 22px 0;padding:0;list-style:none}
-ul.scopes li{padding:9px 12px;background:#f8f9ff;border-left:4px solid #667eea;border-radius:4px;margin-bottom:8px;font-size:14px}
-.btnrow{display:flex;gap:10px}.btnrow button{flex:1}button.deny{background:#eee;color:#555}
-</style></head><body>
-<div class="card">
-  <div class="logo">🔐 Access-Nex</div><div class="sub">Device Sign-In</div>
-  <h1>Connect this device?</h1>
-  <p class="hint"><strong>` + esc(clientName) + `</strong> wants access to:</p>
-  <ul class="scopes">` + scopeItems + `</ul>
-  <form method="post" action="/device">
-    <input type="hidden" name="user_code" value="` + esc(userCode) + `">
-    <div class="btnrow">
-      <button type="submit" name="decision" value="approve">Allow</button>
-      <button type="submit" name="decision" value="deny" class="deny">Deny</button>
-    </div>
-  </form>
-</div></body></html>`
-	w.Header().Set("Content-Type", "text/html; charset=utf-8")
-	w.Write([]byte(page))
-}
-
-func (s *Server) renderDeviceResult(w http.ResponseWriter, approved bool) {
-	msg := "Device connected. You can close this window."
-	if !approved {
-		msg = "Request denied. You can close this window."
-	}
-	page := `<!doctype html><html lang="en"><head><meta charset="utf-8">
-<meta name="viewport" content="width=device-width,initial-scale=1"><title>Device Sign-In — Access-Nex</title>` + loginStyle + `</head><body>
-<div class="card"><div class="logo">🔐 Access-Nex</div><h1>` + esc(msg) + `</h1></div></body></html>`
-	w.Header().Set("Content-Type", "text/html; charset=utf-8")
-	w.Write([]byte(page))
+	s.store.Audit("device_"+status, subject, "", clientIP(r), userCode)
+	http.Redirect(w, r, "/device/result?approved="+strconv.FormatBool(status == models.DeviceStatusApproved), http.StatusFound)
 }
 
 // handleDeviceCodeGrant implements the polling side of RFC 8628 at /token.

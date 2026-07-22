@@ -73,3 +73,9 @@ Testing/
 
 # access-nex runtime data: SQLite database, AES secret key, RSA signing key
 .access-nex/
+
+# Python frontend
+__pycache__/
+*.pyc
+.venv/
+venv/

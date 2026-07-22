@@ -1,11 +1,25 @@
-# Swapping the frontend
+# The frontend/backend split
 
-Access-Nex ships with a server-rendered HTML frontend (`/login`, `/portal`,
-`/admin`, `/device`, the consent screen) written in Go, for zero-setup use.
-That frontend is optional: everything it does is also reachable as JSON, so
-it can be replaced with a custom frontend — in Python, or anything else —
-without touching the Go code, and the two can run side by side while you
-migrate.
+Access-Nex is two services:
+
+- **The Go backend** (`internal/server`) implements the OIDC/OAuth2 protocol,
+  sessions, 2FA/WebAuthn, and everything else as a JSON API (`/api/v1/*` for
+  account management, `/api/admin/*` for admin) plus the OAuth2/OIDC
+  endpoints themselves. It renders no HTML at all.
+- **The Python/FastAPI frontend** (`frontend/`, entry point `main.py` at the
+  repo root) renders every browser-facing page — home, login, 2FA, consent,
+  portal, admin console, device flow, password reset — using that JSON API,
+  and transparently proxies anything else (the OAuth2/OIDC endpoints, form
+  submissions its pages post to, ...) straight through to the Go backend.
+  Point a browser at the frontend (`ACCESS_NEX_BACKEND_URL` tells it where
+  the backend is), not at the Go backend directly — the backend has no pages
+  of its own to serve.
+
+Because the split runs through a JSON API rather than any Python-specific
+hook, the frontend isn't privileged: it's just the first consumer of a
+contract any other frontend, in any language, could implement the same way.
+Replacing it doesn't require touching the Go code, and a replacement can run
+side by side with it while you migrate.
 
 The full HTTP contract is in [openapi.yaml](openapi.yaml). This document is
 the "why" and "how" behind it.
@@ -18,12 +32,27 @@ the "why" and "how" behind it.
 | Account management | `/api/v1/*` (login, 2FA, password, sessions, grants, linked identities, password reset) | JSON |
 | Passkey/security-key ceremonies | `/portal/webauthn/*`, `/login/webauthn/*` | JSON (WebAuthn is a JS/browser API either way) |
 | Admin (users/apps/providers/audit) | `/api/admin/*` | JSON |
+| Frontend support data (`internal/server/page_support.go`) | Extra `/api/v1/*` routes — home-page counts, the public app directory, 2FA/device-flow status — that exist only because a rendered page needs them | JSON, not part of the stable contract in openapi.yaml |
 | Metrics | `/metrics` | Prometheus text format |
-| **HTML pages** (replaceable) | `/login`, `/portal`, `/admin`, `/device`, consent screen | Server-rendered HTML + inline JS |
+| **HTML pages** (the frontend's job) | `/`, `/login`, `/login/2fa`, `/consent`, `/portal`, `/portal/2fa`, `/admin`, `/device`, `/apps`, `/forgot-password`, `/reset-password`, `/message`, `/logout` | Server-rendered HTML (Jinja2) |
 
-A custom frontend re-implements the HTML-page row and calls everything else
-directly. Nothing in the Go server needs to change to support this — the
-JSON endpoints are the same ones the built-in pages already call internally.
+A replacement frontend re-implements the HTML-page row and calls everything
+else directly. Nothing in the Go server needs to change to support this — the
+JSON endpoints are the same ones `frontend/` already calls.
+
+## How `/authorize` hands off to the frontend
+
+`/authorize` keeps 100% of its OAuth2 logic in Go (client/redirect_uri
+validation, session/consent checks, code issuance) — nothing about the
+protocol itself moved. The only change is what happens when it needs to
+*show something* mid-flow: instead of rendering HTML inline, it 302-redirects
+the browser to the frontend's `/login`, `/login/2fa`, or `/consent`, with the
+original request's fields (client_id, redirect_uri, scope, state, nonce,
+code_challenge, ...) carried as query parameters (`internal/server/web.go`'s
+`redirectToOAuthLogin`/`redirectToOAuthTOTP`/`redirectToConsent`). Those
+pages render a form whose `action` posts straight back to `/authorize` (or
+`/login/2fa`, `/device`, ...) — which the frontend's catch-all proxy forwards
+to Go unchanged, so the round trip is indistinguishable from same-origin.
 
 ## Recommended topology: same-origin via reverse proxy
 
@@ -39,6 +68,15 @@ cookie (`oidc_sid`) is `SameSite=Lax` (and `Secure` once served over HTTPS —
 see `provider self init --issuer https://...`). Same-origin means the
 browser sends it automatically on every `fetch()` to the API paths, with no
 CORS configuration needed at all.
+
+`frontend/` *is* this topology, just with the reverse proxy built into the
+frontend process itself instead of a separate nginx/Caddy/Traefik hop
+(`frontend/backend.py`'s `proxy()`): every request lands on the frontend's
+origin, which either renders a page or forwards the request to access-nex
+verbatim (redirects, `Set-Cookie`, everything) — a browser never talks to
+the Go backend directly. A from-scratch replacement frontend that isn't
+built this way still needs *something* in front of both services doing the
+same job.
 
 ## Alternative: a separately-hosted, cross-origin frontend
 

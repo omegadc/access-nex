@@ -1,0 +1,36 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>{{ title }} — {{ brand }}</title>
+<link rel="stylesheet" href="/static/css/styles.css">
+{% block extra_head %}{% endblock %}
+</head>
+<body>
+<nav class="topnav">
+  <a class="topnav-brand" href="/">🔐 {{ brand }}</a>
+  <div class="topnav-links">
+    <a href="/">Home</a>
+    <a href="/apps">Applications</a>
+    {% if user %}
+      <a href="/portal">My Account</a>
+      {% if user.is_admin %}<a href="/admin">Admin</a>{% endif %}
+    {% endif %}
+  </div>
+  <div class="topnav-right">
+    {% if user %}
+      <span>👤 {{ user.username }}</span>
+      <a class="btn btn-sm" href="/portal/logout">Sign Out</a>
+    {% else %}
+      <a class="btn btn-sm btn-primary" href="/login">Sign In</a>
+    {% endif %}
+  </div>
+</nav>
+<div class="main-wrap">
+  {% block content %}{% endblock %}
+</div>
+<p class="footer-note">{{ brand }} — OAuth2 &amp; OIDC Provider</p>
+{% block extra_scripts %}{% endblock %}
+</body>
+</html>

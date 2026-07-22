@@ -1,0 +1,71 @@
+{% extends "base_app.html" %}
+{% block content %}
+<div class="page-header">
+  <div class="page-title">Two-Factor Authentication</div>
+</div>
+{% if error == 'invalid' %}<div class="alert alert-error">Invalid code — try again.</div>{% endif %}
+
+<div class="card">
+  <div class="card-header"><span class="card-title">Authenticator App (TOTP)</span></div>
+  <div class="card-body">
+    {% if totp.enabled %}
+      <p class="alert alert-success">✓ Two-factor authentication is enabled.</p>
+      <form method="post" action="/portal/2fa/disable">
+        <div class="field"><label for="c">Enter a code to disable 2FA</label><input type="text" id="c" name="totp_code" inputmode="numeric" maxlength="6" required></div>
+        <button type="submit" class="btn btn-danger">Disable 2FA</button>
+      </form>
+    {% elif totp.pending_secret %}
+      <p class="auth-hint">Scan this with your authenticator app (Google Authenticator, Authy, 1Password, …), then enter the 6-digit code it shows to confirm.</p>
+      <img src="{{ totp.qr_data_uri }}" alt="QR code" style="display:block;margin:0 auto 16px;width:200px;height:200px;border-radius:8px">
+      <p style="text-align:center;font-family:var(--font-mono);font-size:13px;background:var(--bg-base);border:0.5px solid var(--border);padding:8px;border-radius:6px;margin-bottom:20px;word-break:break-all">{{ totp.pending_secret }}</p>
+      <form method="post" action="/portal/2fa/confirm">
+        <div class="field"><label for="c">Confirmation code</label><input type="text" id="c" name="totp_code" inputmode="numeric" maxlength="6" required autofocus></div>
+        <button type="submit" class="btn btn-primary">Confirm &amp; Enable</button>
+      </form>
+    {% else %}
+      <p class="auth-hint">Two-factor authentication adds a second step (a 6-digit code from an authenticator app) to your login.</p>
+      <form method="post" action="/portal/2fa/enroll"><button type="submit" class="btn btn-primary">Set Up 2FA</button></form>
+    {% endif %}
+  </div>
+</div>
+
+<div class="card">
+  <div class="card-header"><span class="card-title">Security Keys &amp; Passkeys</span></div>
+  <div class="card-body">
+    <p class="auth-hint">Use a hardware security key, or your device's built-in passkey support (Windows Hello, Touch ID, …), as a second factor.</p>
+    {% if totp.webauthn_enabled %}
+    <table style="margin-bottom:16px">
+      <thead><tr><th>Name</th><th>Added</th><th></th></tr></thead>
+      <tbody>
+        {% for c in totp.credentials %}
+        <tr>
+          <td class="td-name">{{ c.name }}</td>
+          <td>{{ c.created_at[:10] }}</td>
+          <td><form method="post" action="/portal/webauthn/delete" class="inline-form">
+            <input type="hidden" name="credential_id" value="{{ c.id }}">
+            <button type="submit" class="btn btn-danger btn-sm">Remove</button>
+          </form></td>
+        </tr>
+        {% else %}
+        <tr class="empty-row"><td colspan="3">No security keys registered</td></tr>
+        {% endfor %}
+      </tbody>
+    </table>
+    <button class="btn" onclick="onRegisterKey()">+ Add a Security Key</button>
+    <p id="wa-reg-msg" style="margin-top:8px;font-size:13px;color:var(--text-secondary)"></p>
+    {% else %}
+    <p style="color:var(--text-muted)">Security keys aren't available on this server (couldn't derive a WebAuthn relying-party ID from the issuer URL).</p>
+    {% endif %}
+  </div>
+</div>
+
+<p><a href="/portal">← Back to portal</a></p>
+{% endblock %}
+{% block extra_scripts %}
+<script src="/static/js/webauthn.js"></script>
+<script>
+function onRegisterKey() {
+  registerSecurityKey(document.getElementById('wa-reg-msg'), function () { window.location.reload(); });
+}
+</script>
+{% endblock %}

@@ -1,0 +1,19 @@
+{% extends "base_auth.html" %}
+{% block subtitle %}Authorization Request{% endblock %}
+{% block content %}
+<h1>{{ client_name }} wants access to:</h1>
+<p class="auth-hint">Signed in as <strong>{{ username }}</strong></p>
+<ul class="scopes">
+  {% for sc in scopes %}
+  <li><strong>{{ sc }}</strong> — {{ scope_descriptions.get(sc, "Scope: " + sc) }}</li>
+  {% endfor %}
+</ul>
+<form method="post" action="/authorize">
+  {% for k, v in fields.items() %}{% if v %}<input type="hidden" name="{{ k }}" value="{{ v }}">{% endif %}{% endfor %}
+  <div class="btnrow">
+    <button type="submit" name="consent" value="approve" class="btn btn-primary">Allow</button>
+    <button type="submit" name="consent" value="deny" class="btn">Deny</button>
+  </div>
+</form>
+<div class="auth-footer">Your decision is remembered for this application.</div>
+{% endblock %}
