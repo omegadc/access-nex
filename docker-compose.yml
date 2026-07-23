@@ -1,5 +1,8 @@
-# Access-Nex + PostgreSQL. `docker compose up -d`, then run the CLI commands
-# below (once) to create your first admin user and application.
+# Access-Nex + PostgreSQL. Copy .env.example to .env (and set a real
+# POSTGRES_PASSWORD) before the first `docker compose up -d` — the db
+# service's environment: block below refuses to start without it. Then run
+# the CLI commands below (once) to create your first admin user and
+# application.
 #
 # Three services: PostgreSQL, the Go backend (access-nex — OIDC/OAuth2
 # protocol + JSON APIs, see docs/FRONTEND.md), and the Python/FastAPI
@@ -12,9 +15,16 @@
 # of requiring a separate nginx/Caddy/Traefik.
 #
 # First-time setup:
+#   cp .env.example .env && edit it
 #   docker compose up -d
-#   docker compose exec access-nex access-nex --db "$ACCESS_NEX_DB" user add -u admin -p CHANGE_ME --admin --verified
-#   docker compose exec access-nex access-nex --db "$ACCESS_NEX_DB" app create -n "My App" -r https://your-app/callback
+#   docker compose exec access-nex access-nex --db "postgres://accessnex:<POSTGRES_PASSWORD>@db:5432/accessnex?sslmode=disable" user add -u admin -p CHANGE_ME --admin --verified
+#   docker compose exec access-nex access-nex --db "postgres://accessnex:<POSTGRES_PASSWORD>@db:5432/accessnex?sslmode=disable" app create -n "My App" -r https://your-app/callback
+#
+# Note: the access-nex image is distroless (no shell at all), so
+# "--db \"$ACCESS_NEX_DB\"" can't be expanded inside `docker compose exec` —
+# there's no shell there to expand it, and your host shell doesn't have that
+# variable either (it only exists inside the container's own environment).
+# Substitute the actual password from .env directly, as above.
 #
 # access-nex auto-initializes the local OIDC provider on first `server`
 # start (using --issuer below), so no separate init step is needed for that.
