@@ -239,7 +239,7 @@ async def device_page(request: Request):
         status, data = await get_json(
             request, "/api/v1/device", params={"user_code": user_code}
         )
-        if status == 200:
+        if status == 200 and data:
             return templates.TemplateResponse(
                 request,
                 "device.html",
