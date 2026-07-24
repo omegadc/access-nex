@@ -220,6 +220,173 @@ func (s *Server) apiListProviders(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, map[string]any{"providers": out})
 }
 
+// providerReq carries the fields the CLI's provider add/update flags accept;
+// empty fields are left untouched on update, mirroring applyProviderFlags.
+type providerReq struct {
+	Name             string   `json:"name"`
+	Template         string   `json:"template"`
+	ClientID         string   `json:"client_id"`
+	ClientSecret     string   `json:"client_secret"`
+	RedirectURL      string   `json:"redirect_url"`
+	AuthorizationURL string   `json:"authorization_url"`
+	AccessTokenURL   string   `json:"access_token_url"`
+	ResourceURL      string   `json:"resource_url"`
+	LogoutURL        string   `json:"logout_url"`
+	UserIdentifier   string   `json:"user_identifier"`
+	Scopes           []string `json:"scopes"`
+}
+
+func (req *providerReq) applyOverrides(p *models.Provider) {
+	if req.RedirectURL != "" {
+		p.RedirectURL = req.RedirectURL
+	}
+	if req.AuthorizationURL != "" {
+		p.AuthorizationURL = req.AuthorizationURL
+	}
+	if req.AccessTokenURL != "" {
+		p.AccessTokenURL = req.AccessTokenURL
+	}
+	if req.ResourceURL != "" {
+		p.ResourceURL = req.ResourceURL
+	}
+	if req.LogoutURL != "" {
+		p.LogoutURL = req.LogoutURL
+	}
+	if req.UserIdentifier != "" {
+		p.UserIdentifier = req.UserIdentifier
+	}
+	if len(req.Scopes) > 0 {
+		p.Scopes = req.Scopes
+	}
+}
+
+// apiCreateProvider is the web counterpart of `provider add`.
+func (s *Server) apiCreateProvider(w http.ResponseWriter, r *http.Request) {
+	var req providerReq
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil ||
+		req.Name == "" || req.ClientID == "" || req.ClientSecret == "" {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "name, client_id and client_secret required"})
+		return
+	}
+	p := &models.Provider{
+		ID: fmt.Sprintf("provider-%s-%d",
+			strings.ToLower(strings.ReplaceAll(req.Name, " ", "-")), time.Now().UnixNano()),
+		Name:           req.Name,
+		Kind:           models.ProviderKindOAuth2,
+		Template:       req.Template,
+		ClientID:       req.ClientID,
+		UserIdentifier: "id",
+		Scopes:         []string{"openid", "profile", "email"},
+		Enabled:        true,
+	}
+	if tmpl := models.ProviderTemplates[req.Template]; tmpl != nil {
+		p.Kind = tmpl.Kind
+		p.AuthorizationURL = tmpl.AuthorizationURL
+		p.AccessTokenURL = tmpl.AccessTokenURL
+		p.ResourceURL = tmpl.ResourceURL
+		p.LogoutURL = tmpl.LogoutURL
+		p.UserIdentifier = tmpl.UserIdentifier
+		p.Scopes = tmpl.Scopes
+	}
+	req.applyOverrides(p)
+	var err error
+	if p.ClientSecretEnc, err = s.box.Encrypt(req.ClientSecret); err != nil {
+		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "failed to encrypt secret"})
+		return
+	}
+	if err := s.store.CreateProvider(p); err != nil {
+		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": err.Error()})
+		return
+	}
+	s.store.Audit("admin_provider_created", "", "", clientIP(r), p.ID+" by "+s.adminFromSession(r).Username)
+	writeJSON(w, http.StatusCreated, map[string]any{
+		"id": p.ID, "name": p.Name, "kind": p.Kind, "template": p.Template, "scopes": p.Scopes,
+	})
+}
+
+// externalProvider loads a provider by ID, refusing the internal "self" row.
+func (s *Server) externalProvider(id string) *models.Provider {
+	p, err := s.store.GetProvider(id)
+	if err != nil || p.Kind == models.ProviderKindInternal {
+		return nil
+	}
+	return p
+}
+
+// apiShowProvider is the web counterpart of `provider show`. The client
+// secret is decrypted only to be masked, exactly like the CLI does.
+func (s *Server) apiShowProvider(w http.ResponseWriter, r *http.Request) {
+	p := s.externalProvider(r.PathValue("id"))
+	if p == nil {
+		writeJSON(w, http.StatusNotFound, map[string]string{"error": "provider not found"})
+		return
+	}
+	secret := "[unable to decrypt]"
+	if plain, err := s.box.Decrypt(p.ClientSecretEnc); err == nil {
+		secret = maskSecret(plain)
+	}
+	writeJSON(w, http.StatusOK, map[string]any{
+		"id":                p.ID,
+		"name":              p.Name,
+		"kind":              p.Kind,
+		"template":          p.Template,
+		"client_id":         p.ClientID,
+		"client_secret":     secret,
+		"redirect_url":      p.RedirectURL,
+		"authorization_url": p.AuthorizationURL,
+		"access_token_url":  p.AccessTokenURL,
+		"resource_url":      p.ResourceURL,
+		"logout_url":        p.LogoutURL,
+		"user_identifier":   p.UserIdentifier,
+		"scopes":            p.Scopes,
+		"enabled":           p.Enabled,
+		"created_at":        p.CreatedAt.Format(time.RFC3339),
+		"updated_at":        p.UpdatedAt.Format(time.RFC3339),
+	})
+}
+
+// apiUpdateProvider is the web counterpart of `provider update`.
+func (s *Server) apiUpdateProvider(w http.ResponseWriter, r *http.Request) {
+	p := s.externalProvider(r.PathValue("id"))
+	if p == nil {
+		writeJSON(w, http.StatusNotFound, map[string]string{"error": "provider not found"})
+		return
+	}
+	var req providerReq
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid JSON body"})
+		return
+	}
+	if req.Name != "" {
+		p.Name = req.Name
+	}
+	if req.ClientID != "" {
+		p.ClientID = req.ClientID
+	}
+	if req.ClientSecret != "" {
+		enc, err := s.box.Encrypt(req.ClientSecret)
+		if err != nil {
+			writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "failed to encrypt secret"})
+			return
+		}
+		p.ClientSecretEnc = enc
+	}
+	req.applyOverrides(p)
+	if err := s.store.UpdateProvider(p); err != nil {
+		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": err.Error()})
+		return
+	}
+	s.store.Audit("admin_provider_updated", "", "", clientIP(r), p.ID+" by "+s.adminFromSession(r).Username)
+	writeJSON(w, http.StatusOK, map[string]string{"updated": p.ID})
+}
+
+func maskSecret(secret string) string {
+	if len(secret) <= 4 {
+		return "****"
+	}
+	return secret[:4] + "****"
+}
+
 func (s *Server) apiDeleteProvider(w http.ResponseWriter, r *http.Request) {
 	id := r.PathValue("id")
 	if err := s.store.DeleteProvider(id); err != nil {

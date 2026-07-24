@@ -42,11 +42,29 @@
 
 <div class="card">
   <div class="card-header"><span class="card-title">External Providers</span></div>
-  <div class="card-body"><p style="font-size:13px;color:var(--text-secondary)">Add providers via the CLI: <code>access-nex provider add -t google ...</code></p></div>
+  <div class="card-body">
+    <div class="toolbar">
+      <input type="text" id="np-name" placeholder="provider name">
+      <select id="np-template">
+        <option value="custom">custom</option>
+        <option value="google">google</option>
+        <option value="github">github</option>
+        <option value="microsoft">microsoft</option>
+        <option value="discord">discord</option>
+        <option value="okta">okta</option>
+      </select>
+      <input type="text" id="np-client-id" placeholder="client ID">
+      <input type="password" id="np-client-secret" placeholder="client secret">
+      <input type="text" id="np-redirect" placeholder="redirect URL (optional)" style="min-width:220px">
+      <button class="btn btn-primary btn-sm" onclick="createProvider()">Add Provider</button>
+      <span class="msg" id="p-msg"></span>
+    </div>
+  </div>
   <table>
     <thead><tr><th>Name</th><th>ID</th><th>Kind</th><th>Enabled</th><th></th></tr></thead>
     <tbody id="prov-table"><tr class="empty-row"><td colspan="5">Loading…</td></tr></tbody>
   </table>
+  <div class="card-body" id="prov-details" style="display:none"></div>
 </div>
 
 <div class="card">

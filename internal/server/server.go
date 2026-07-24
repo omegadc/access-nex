@@ -210,6 +210,9 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("POST /api/admin/apps", s.requireAdminAPI(s.apiCreateApp))
 	mux.HandleFunc("DELETE /api/admin/apps/{id}", s.requireAdminAPI(s.apiDeleteApp))
 	mux.HandleFunc("GET /api/admin/providers", s.requireAdminAPI(s.apiListProviders))
+	mux.HandleFunc("POST /api/admin/providers", s.requireAdminAPI(s.apiCreateProvider))
+	mux.HandleFunc("GET /api/admin/providers/{id}", s.requireAdminAPI(s.apiShowProvider))
+	mux.HandleFunc("PUT /api/admin/providers/{id}", s.requireAdminAPI(s.apiUpdateProvider))
 	mux.HandleFunc("DELETE /api/admin/providers/{id}", s.requireAdminAPI(s.apiDeleteProvider))
 	mux.HandleFunc("GET /api/admin/audit", s.requireAdminAPI(s.apiListAudit))
 
